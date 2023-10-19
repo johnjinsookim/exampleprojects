@@ -1,0 +1,259 @@
+drop table #InvoiceACH
+select a.*, c.usersubscriptionInvoiceID, c.invoicestatus, c.invoicedate, c.attempts, c.lastattempteddate, c.usersubscriptionID, c.collectionType
+into #InvoiceACH
+from AchTransactions a
+inner join usersubscriptioninvoiceACHTransaction b 
+on a.AchTransactionID = b.AchTransactionID
+inner join usersubscriptionInvoice c 
+on b.usersubscriptionInvoiceID = c.usersubscriptionInvoiceID
+where a.dateInitiated > '2022-04-01'
+and c.invoiceDate > '2022-04-01'
+​
+​
+drop table #InvoiceStripe
+select a.*, c.usersubscriptionInvoiceID, c.invoicestatus, c.invoicedate, c.attempts, c.lastattempteddate, c.usersubscriptionID, c.collectionType
+into #InvoiceStripe
+from StripeTransactions a
+inner join usersubscriptioninvoiceStripeTransaction b 
+on a.StripeTransactionID = b.StripeTransactionID
+inner join usersubscriptionInvoice c 
+on b.usersubscriptionInvoiceID = c.usersubscriptionInvoiceID
+where a.createdAt > '2022-04-01'
+and c.invoiceDate > '2022-04-01'
+​
+drop table #ACH_Stripe_attempts
+select * 
+into #ACH_Stripe_attempts
+from (
+(select usersubscriptionID, collectiontype,'ACH' as ACH_or_Stripe, AchTransactionID as DebitID, Amount, 
+    case when [Status] = 0 then 'pending'
+				 when [Status] = 1 then 'canceled'
+				 when [Status] = 2 then 'processing'
+				 when [Status] = 3 then 'hold'
+				 when [Status] = 4 then 'succeeded'
+				 when [Status] = 5 then 'failed'
+				 when [Status] = 6 then 'corrected' end as [Status],'ACH' as StripeStatus, Datesubmitted as createdAt,
+    userSubscriptionInvoiceID, invoiceStatus, invoicedate, attempts, lastattempteddate, [Type], Speed
+from #InvoiceACH)
+union
+(select usersubscriptionID, collectiontype,'Stripe' as ACH_or_Stripe, StripeTransactionID as DebitID, Amount, 		
+			case when [Status] = 0 then 'pending'
+				 when [Status] = 1 then 'succeeded'
+				 when [Status] = 2 then 'failed' end as [Status],StripeStatus, createdAt,
+    userSubscriptionInvoiceID, invoiceStatus, invoicedate, attempts, lastattempteddate, -100 as [Type], -100 as Speed
+from #InvoiceStripe)) as a
+group by usersubscriptionID, collectiontype,ACH_or_Stripe, DebitID, Amount, 
+    [Status],StripeStatus,createdAt,
+    userSubscriptionInvoiceID, invoiceStatus, invoicedate, attempts, lastattempteddate, [Type], Speed
+order by usersubscriptionID
+​
+​
+drop table #Subscriptions
+SELECT
+a.*, collectiontype, ACH_or_Stripe, DebitID, Amount, [Status],StripeStatus, c.createdAt as debit_Created_at,
+    userSubscriptionInvoiceID, invoiceStatus, invoicedate, attempts, lastattempteddate,[Type],Speed
+INTO #Subscriptions
+from [UserSubscription] a 
+left join #ACH_Stripe_attempts c on a.userSubscriptionID = c.userSubscriptionID
+where StartDate >= '2022-12-31'
+​
+​
+drop table #Subscriptions2
+SELECT
+a.*,
+DateGenerated,
+UserCreditVariableId,
+FIRST_VALUE(DateGenerated) OVER(PARTITION BY a.UserId, startDate ORDER BY DateGenerated DESC) AS DateGenerated_last,
+case when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 1 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 1 then 'BruteForce'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 2 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 2 then 'DeepSearch'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 3 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 3 then 'Tagging'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 4 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 4 then 'VariableIncome'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 5 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 5 then 'SinglePaycheckAtEmpower'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 7 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 7 then 'MinimalIncome'
+	else 'None'
+end AS [PaycheckModelUsed], 
+MLModelScore
+INTO #Subscriptions2
+from #Subscriptions a
+left join (select UserId, UserCreditVariableId, DateGenerated, PaycheckArchetype, MLModelScore
+	from UserCreditVariable
+	where 
+			(DateGenerated >= '2022-12-31')
+	) b 
+on a.UserId = b.UserId 
+and DateGenerated < DATEADD(Day,2,startDate)
+and DateGenerated > DATEADD(Day,-2,startDate);
+​
+drop table #Subscriptions3
+SELECT
+*
+INTO #Subscriptions3
+from #Subscriptions2 a
+where (DateGenerated = DateGenerated_last or DateGenerated is null);
+​
+​
+drop table #Subscriptions4
+select a.*,
+FIRST_VALUE(createdAt) OVER(PARTITION BY a.UserSubscriptionID ORDER BY createdAt DESC) AS Last_dt,
+FIRST_VALUE(createdAt) OVER(PARTITION BY a.UserSubscriptionID ORDER BY createdAt ASC) AS First_dt,
+FIRST_VALUE(ACH_or_Stripe) OVER(PARTITION BY a.UserSubscriptionID ORDER BY createdAt DESC) AS Last_Type,
+FIRST_VALUE(ACH_or_Stripe) OVER(PARTITION BY a.UserSubscriptionID ORDER BY createdAt ASC) AS First_Type,
+case when MLModelScore is null then 'null'
+	 when MLModelScore <= .03 then '<3%'
+	 when MLModelScore <= .05 then '3%-5%'
+	 when MLModelScore <= .10 then '5%-10%'
+	 when MLModelScore <= .15 then '10%-15%'
+	 when MLModelScore <= .20 then '15%-20%'
+	 when MLModelScore <= .25 then '20%-25%'
+	 when MLModelScore <= .30 then '25%-30%'
+	 when MLModelScore > .30 then '>30%'
+    end as Hydrogen_bucket,
+-- Institution name
+d.Name as InstitutionName,
+-- Restricted vs. non-restricted; won't need
+case when d.ExternalProviderId in  ('ins_110730','ins_116831','ins_117321','ins_113967','ins_125234','ins_117881','ins_35','ins_117179','ins_126340',
+				'ins_118390','ins_100007','ins_24','ins_116185','ins_126339','ins_115614','ins_129229'
+				,'ins_115640','ins_111998','ins_54','ins_117416','ins_129417','ins_115686') then 1
+	 else 0
+	 end as IsRestrictedEligibilityInstitution
+Into #Subscriptions4
+from #Subscriptions3 a
+left join Account b 
+on a.accountID = b.AccountId
+left join InstitutionAccount c
+on b.InstitutionAccountId = c.InstitutionAccountId
+left join Institution d 
+on c.InstitutionIdentifier = d.InstitutionId;
+​
+​
+drop table #Subscriptions5
+select 
+a.*,
+case 
+when [Status] = 'succeeded' and createdAt < dateadd(day,1,InvoiceDate) then 0
+when [Status] = 'succeeded' and createdAt < dateadd(day,2,InvoiceDate) then 1
+when [Status] = 'succeeded' and createdAt < dateadd(day,3,InvoiceDate) then 2
+when [Status] = 'succeeded' and createdAt < dateadd(day,4,InvoiceDate) then 3
+when [Status] = 'succeeded' and createdAt < dateadd(day,5,InvoiceDate) then 4
+when [Status] = 'succeeded' and createdAt < dateadd(day,6,InvoiceDate) then 5
+when [Status] = 'succeeded' and createdAt < dateadd(day,7,InvoiceDate) then 6
+when [Status] = 'succeeded' and createdAt < dateadd(day,8,InvoiceDate) then 7
+when [Status] = 'succeeded' and createdAt < dateadd(day,14,InvoiceDate) then 14
+when [Status] = 'succeeded' and createdAt < dateadd(day,21,InvoiceDate) then 21
+when [Status] = 'succeeded' and createdAt < dateadd(day,28,InvoiceDate) then 28
+when [Status] = 'succeeded' and createdAt < dateadd(day,35,InvoiceDate) then 35
+when [Status] = 'succeeded' and createdAt < dateadd(day,42,InvoiceDate) then 42
+when [Status] = 'succeeded' and createdAt >= dateadd(day,42,InvoiceDate) then 49
+​
+when [Status] = 'pending' then -1
+when [Status] = 'failed' then -2
+else -3
+end as payment_status,
+Case when Last_dt = createdAt then 1 else 0 end as LastDebit,
+case 
+    when InvoiceDate <= DATEADD(month,1,StartDate) then 'M1'
+    when InvoiceDate > DATEADD(Month,1,StartDate) and InvoiceDate <= DATEADD(Month,2,StartDate) then 'M2'
+else 'other'
+end as M1_M2_Repayment,
+datediff(day,invoicedate,debit_created_at) as debit_gap
+Into #Subscriptions5
+from #Subscriptions4 a
+​
+/*************************************************************************************************************
+BALANCE CHECK WORK
+*************************************************************************************************************/
+​
+drop table #Subscriptions6
+select
+userSubscriptionID, UserID, AccountID, SubscriptionType, StartDate, EndDate, SubscriptionStatus, Amount, 
+userSubscriptionInvoiceID, InvoiceStatus, InvoiceDate, attempts, lastattempteddate, dategenerated,paycheckmodelused,MLModelScore, Last_dt, first_dt, Last_type,First_Type,
+Hydrogen_bucket, InstitutionName, IsRestrictedEligibilityInstitution,M1_M2_Repayment
+into #Subscriptions6
+from #Subscriptions5
+group by userSubscriptionID, UserID, AccountID, SubscriptionType, StartDate, EndDate, SubscriptionStatus, Amount, 
+userSubscriptionInvoiceID, InvoiceStatus, InvoiceDate, attempts, lastattempteddate, dategenerated,paycheckmodelused,MLModelScore, Last_dt, first_dt, Last_type,First_Type,
+Hydrogen_bucket, InstitutionName, IsRestrictedEligibilityInstitution,M1_M2_Repayment
+order by userSubscriptionID, UserID, AccountID, SubscriptionType, StartDate, EndDate, SubscriptionStatus, Amount, 
+userSubscriptionInvoiceID, InvoiceStatus, InvoiceDate, attempts, lastattempteddate, dategenerated,paycheckmodelused,MLModelScore, Last_dt, first_dt, Last_type,First_Type,
+Hydrogen_bucket, InstitutionName, IsRestrictedEligibilityInstitution,M1_M2_Repayment
+​
+drop table #duplicateSubs
+select UserId, UserSubscriptionId, AccountID,M1_M2_Repayment, SubscriptionStatus, count(*) as dup_cnt
+into #duplicateSubs
+from #Subscriptions6 
+where (M1_M2_Repayment = 'M1' or M1_M2_Repayment = 'M2')
+group by UserId, UserSubscriptionId, AccountID,M1_M2_Repayment, SubscriptionStatus having count(*) > 1
+​
+drop table #Subscriptions7
+select *
+into #Subscriptions7
+from #Subscriptions6
+where userSubscriptionID not in
+	(select userSubscriptionID from #duplicateSubs)
+​
+​
+drop table #RecentBalances
+select * into #RecentBalances from accountbalancedetail where dateadded > '2022-04-01'
+​
+​
+drop table #Bal_Check_Sub
+select a.*, case when b.availableBalance is null then 1 else 0 end as NullBal,
+b.currentbalance,b.availableBalance, b.dateadded, b.source,datediff(day,a.invoiceDate,b.dateadded) as balanceDateGap,
+into #Bal_Check_Sub
+from #Subscriptions6 a
+left join #RecentBalances b 
+on a.AccountId = b.AccountId
+and b.dateAdded >= dateadd(day,0,a.invoiceDate)
+and (b.dateAdded <= dateadd(day,31,a.invoicedate))
+order by UserSubscriptionID, accountID, InvoiceDate
+​
+drop table #Bal_Check_Sub_int
+select *,
+first_value(NullBal) OVER(PARTITION BY a.UserId, a.userSubscriptionID ORDER BY NullBal ASC) AS AllBalsNull,
+FIRST_VALUE(dateadded) OVER(PARTITION BY a.UserId, a.userSubscriptionID ORDER BY NullBal ASC, dateadded DESC) AS LastBalanceCheck,
+case when availableBalance > amount then 1 else 0 end as DebitableBalance
+into #Bal_Check_Sub_int
+from #Bal_Check_Sub a
+​
+​
+drop table #Bal_Check_Sub2
+select *, datediff(day,invoiceDate,LastBalanceCheck) as LastBalDateGap
+into #Bal_Check_Sub2
+from #Bal_Check_Sub_int
+​
+​
+-- Debit Monitoring
+​
+select 
+userSubscriptionID,
+debit_date,
+RepayDate,
+advance_number,	amount, InstitutionName,	IsRestrictedEligibilityInstitution,	PaycheckModelUsed,	Hydrogen_bucket,
+    First_Stripe_or_ACH, ACH_or_Stripe, date_gap, cashadvancestatus,debit_status,
+    returnMessage, collectiontype,first_dt,last_dt,
+debitAttemptCnt as debit_Number,
+count(*) as debit_count
+from #Subscriptions5 a
+group by
+UserCashAdvanceID, debit_date,
+RepayDate,
+advance_number,	amount, InstitutionName,	IsRestrictedEligibilityInstitution,	PaycheckModelUsed,	Hydrogen_bucket,
+    First_Stripe_or_ACH, ACH_or_Stripe, date_gap, cashadvancestatus,debit_status,
+    returnMessage, collectiontype,first_dt,last_dt,
+debitAttemptCnt
+​
+​
+​
+​
+-- Balance Monitoring
+​
+SELECT
+userSubscriptionID,  SubscriptionType, StartDate, EndDate, SubscriptionStatus, Amount, 
+userSubscriptionInvoiceID, InvoiceStatus, InvoiceDate, attempts, lastattempteddate, dategenerated,paycheckmodelused,MLModelScore, Last_dt, first_dt, Last_type,First_Type,
+Hydrogen_bucket, InstitutionName, IsRestrictedEligibilityInstitution,M1_M2_Repayment,
+case when LastBalDateGap > 35 then 0 else 1 end as broken_Connection
+from #Bal_Check_Sub_int
+group by userSubscriptionID,  SubscriptionType, StartDate, EndDate, SubscriptionStatus, Amount, 
+userSubscriptionInvoiceID, InvoiceStatus, InvoiceDate, attempts, lastattempteddate, dategenerated,paycheckmodelused,MLModelScore, Last_dt, first_dt, Last_type,First_Type,
+Hydrogen_bucket, InstitutionName, IsRestrictedEligibilityInstitution,M1_M2_Repayment,
+case when LastBalDateGap > 35 then 0 else 1 end
