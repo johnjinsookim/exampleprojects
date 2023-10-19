@@ -1,0 +1,75 @@
+CREATE TABLE #AdvanceRepayment
+(
+	--Columns from your driver table go here
+	Ach_dt datetime,
+	Last_Ach_dt datetime,
+	Ach_status varchar(15),
+	Stripe_dt datetime,
+	Last_Stripe_dt datetime,
+	Stripe_status varchar(15)
+);
+
+INSERT into #AdvanceRepayment
+SELECT
+a.*
+c.DateSubmitted as Ach_dt,
+FIRST_VALUE(DateSubmitted) OVER(PARTITION BY a.UserCashAdvanceId ORDER BY DateSubmitted DESC) AS Last_Ach_dt,
+c.Status as Ach_status,
+d.CreatedAt as Stripe_dt,
+FIRST_VALUE(CreatedAt) OVER(PARTITION BY a.UserCashAdvanceId ORDER BY CreatedAt DESC) AS Last_Stripe_dt,
+d.Status as Stripe_status
+FROM /*DriverTable*/ a
+	LEFT JOIN (
+		SELECT
+			UserCashAdvanceId,DateSubmitted, 
+			case when [Status] = 0 then 'pending'
+				 when [Status] = 1 then 'canceled'
+				 when [Status] = 2 then 'processing'
+				 when [Status] = 3 then 'hold'
+				 when [Status] = 4 then 'succeeded'
+				 when [Status] = 5 then 'failed'
+				 when [Status] = 6 then 'corrected' end as [Status]
+		FROM UserCashAdvanceAchTransactions a
+			INNER JOIN AchTransactions b ON a.AchTransactionID = b.AchTransactionID
+		WHERE
+			IsDistribution = 0) c ON a.UserCashAdvanceId = c.UserCashAdvanceId
+	LEFT JOIN (
+		SELECT
+			UserCashAdvanceId,CreatedAt, 
+			case when [Status] = 0 then 'pending'
+				 when [Status] = 1 then 'succeeded'
+				 when [Status] = 2 then 'failed' end as [Status]
+		FROM UserCashAdvanceStripeTransactions A
+			INNER JOIN StripeTransactions B ON A.StripeTransactionId = B.StripeTransactionId
+		WHERE
+			IsDistribution = 0) d ON a.UserCashAdvanceId = d.UserCashAdvanceId; 
+
+CREATE TABLE #AdvanceRepayment2
+(
+	--Columns from your driver table go here
+	Ach_dt datetime,
+	Last_Ach_dt datetime,
+	Ach_status varchar(15),
+	Stripe_dt datetime,
+	Last_Stripe_dt datetime,
+	Stripe_status varchar(15)
+);
+
+Insert into #AdvanceRepayment2
+SELECT /*DriverTable columns*/, Ach_dt, Last_Ach_dt, Ach_status, Stripe_dt, Last_Stripe_dt, Stripe_status
+from #AdvanceRepayment
+where (Last_Ach_dt = Ach_dt or Last_Ach_dt is null) and (Last_Stripe_dt = Stripe_dt or Last_Stripe_dt is null)
+group by /*DriverTable columns*/, Ach_dt, Last_Ach_dt, Ach_status, Stripe_dt, Last_Stripe_dt, Stripe_status;
+
+
+case when Ach_status = 'succeeded' and Ach_dt < (RepayDate + 1) then 'On time'
+when Stripe_status = 'succeeded' and Stripe_dt < (RepayDate + 1) then 'On time'
+when Ach_status = 'succeeded' and Ach_dt <= (RepayDate + 7) then '1-7 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 7) then '1-7 late'
+when Ach_status = 'succeeded' and Ach_dt <= (RepayDate + 14) then '8-14 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 14) then '8-14 late'
+when Ach_status = 'succeeded' and Ach_dt > (RepayDate + 14) then '>14 late'
+when Stripe_status = 'succeeded' and Stripe_dt > (RepayDate + 14) then '>14 late'
+when Stripe_status = 'pending' or Ach_status = 'pending' then 'pending'
+when Stripe_status = 'failed' or Ach_status = 'failed' then 'failed'
+else Ach_status
