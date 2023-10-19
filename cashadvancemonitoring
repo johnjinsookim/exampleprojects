@@ -1,0 +1,905 @@
+--drop table #CADistribution
+select 
+a.UserCashAdvanceId, a.Amount, DeliveryType, AdvanceDate, CashAdvanceStatus, b.AchTransactionId, 
+c.StripeTransactionId, d.Status, e.Status as Stripe_status
+into #CADistribution
+from UserCashAdvance a 
+left join UserCashAdvanceAchTransactions b 
+	on a.UserCashAdvanceId = b.UserCashAdvanceId
+	and DeliveryType in (0,1) and b.IsDistribution = 1
+left join UserCashAdvanceStripeTransactions c 
+	on a.UserCashAdvanceId = c.UserCashAdvanceId
+	and DeliveryType = 2 and c.IsDistribution = 1
+left join AchTransactions d
+	on b.ACHTransactionId = d.ACHTransactionId
+left join StripeTransactions e
+	on c.StripeTransactionId = e.StripeTransactionId
+where AdvanceDate > '2020-04-01';
+--drop table #CADistribution2
+select 
+UserCashAdvanceId,
+case when DeliveryType in (0,1) and [Status] in (1,2,3,4,6) then 'success'
+when DeliveryType = 2 and Stripe_status = 1 then 'success'
+else 'failed' end as distribution_status
+into #CADistribution2
+from #CADistribution
+group by UserCashAdvanceId, case when DeliveryType in (0,1) and [Status] in (1,2,3,4,6) then 'success'
+when DeliveryType = 2 and Stripe_status = 1 then 'success' else 'failed' end; 
+--drop table #CADistribution3
+select 
+UserCashAdvanceId
+into #CADistribution3
+from #CADistribution2
+where distribution_status = 'success'
+CREATE TABLE #preAdvances
+(
+	AccountId int, MonitoringAccountId int, UserCashAdvanceId int,
+	AdvanceDate datetime, RepayDate datetime, OriginalRepayDate datetime, Amount int,
+	TipAmount decimal(12,2), UserCashAdvanceSubscriptionId int,
+	CashAdvanceStatus varchar(15), DeliveryType int, delivery_rev int,
+	ca_cost int, UserId int, SubDate datetime,
+	LastSubDate datetime, UserSubscriptionId int
+);
+INSERT INTO #preAdvances
+SELECT
+a.AccountId,
+b.MonitoringAccountId,
+a.UserCashAdvanceId,
+a.AdvanceDate,
+a.RepayDate,
+a.OriginalRepayDate,
+a.Amount,
+a.TipAmount,
+a.UserCashAdvanceSubscriptionId,
+case when CashAdvanceStatus = 2 then 'paid'
+	when CashAdvanceStatus in (1,5,7) then 'pending'
+	when CashAdvanceStatus in (3,4,8) then 'default'
+	when CashAdvanceStatus = 6 then 'error'
+end as CashAdvanceStatus,
+DeliveryType,
+case when DeliveryType = 2 and Amount = 10 and CashAdvanceStatus in (2,5,7) then 1
+case when AdvanceDate > '2022-09-01' and InstantFee is not null and CashAdvanceStatus in (2,5,7) then InstantFee
+	 when AdvanceDate > '2022-09-01' and InstantFee is null then 0 
+	 when DeliveryType = 2 and Amount = 10 and CashAdvanceStatus in (2,5,7) then 1
+	 when DeliveryType = 2 and Amount = 25 and CashAdvanceStatus in (2,5,7) then 2 
+	 when DeliveryType = 2 and Amount = 50 and CashAdvanceStatus in (2,5,7) then 3
+	 when DeliveryType = 2 and Amount = 75 and CashAdvanceStatus in (2,5,7) then 4
+	 when DeliveryType = 2 and Amount = 100 and CashAdvanceStatus in (2,5,7) then 5
+	 when DeliveryType = 2 and Amount = 200 and CashAdvanceStatus in (2,5,7) then 7
+	 when DeliveryType = 2 and Amount = 250 and CashAdvanceStatus in (2,5,7) then 8
+	 when DeliveryType = 2 and Amount = 500 and CashAdvanceStatus in (2,5,7) then 12
+	else 0 end as delivery_rev,
+case when DeliveryType = 2 then 1.43
+	else .4
+	end as ca_cost, 
+b.UserId,
+c.StartDate,
+FIRST_VALUE(StartDate) OVER(PARTITION BY b.UserId, a.AdvanceDate ORDER BY StartDate ASC) AS LastSubDate,
+c.UserSubscriptionId
+from [UserCashAdvance] a with (nolock)
+inner join #CADistribution3 d 
+on a.UserCashAdvanceId = d.UserCashAdvanceId
+inner join [UserCashAdvanceSubscription] b 
+on a.UserCashAdvanceSubscriptionId = b.UserCashAdvanceSubscriptionId 
+left join [UserSubscription] c 
+on b.UserId = c.UserId 
+and StartDate < DATEADD(Day,1,AdvanceDate)
+where AdvanceDate >= '2020-04-01';
+CREATE TABLE #Advances
+(
+	AccountId int, MonitoringAccountId int, UserCashAdvanceId int,
+	AdvanceDate datetime, RepayDate datetime, RepayMoved int, Amount int,
+	TipAmount decimal(12,2), UserCashAdvanceSubscriptionId int,
+	CashAdvanceStatus varchar(15), DeliveryType int, delivery_rev int,
+	ca_cost int, UserId int, SubDate datetime, UserSubscriptionId int
+);
+INSERT INTO #Advances
+SELECT
+AccountId, MonitoringAccountId, UserCashAdvanceId, AdvanceDate, RepayDate, 
+datediff(dd,OriginalRepayDate, RepayDate) as RepayMoved, 
+Amount, TipAmount, UserCashAdvanceSubscriptionId, CashAdvanceStatus, DeliveryType,
+delivery_rev, ca_cost, UserId, SubDate, UserSubscriptionId
+from #preAdvances
+where SubDate = LastSubDate or SubDate is null;
+CREATE TABLE #Advances_2
+(
+	AccountId int, MonitoringAccountId int, UserCashAdvanceId int,
+	AdvanceDate datetime, RepayDate datetime, RepayMoved int, Amount int,
+	TipAmount decimal(12,2), UserCashAdvanceSubscriptionId int,
+	CashAdvanceStatus varchar(15), DeliveryType int, delivery_rev int,
+	ca_cost int, UserId int, SubDate datetime, UserSubscriptionId int,
+	advance_number int
+);
+INSERT INTO #Advances_2
+SELECT
+a.*,
+count(*) as advance_number
+from #Advances a 
+left join 
+	(select 
+	a.UserId,
+	a.AdvanceDate,
+	b.Amount,
+	b.AdvanceDate as prev_adv_dt
+	from #Advances a
+	left join [UserCashAdvance] b 
+	on a.UserCashAdvanceSubscriptionId = b.UserCashAdvanceSubscriptionId
+	and (year(b.AdvanceDate)*10000 + month(b.AdvanceDate)*100 + day(b.AdvanceDate)) <= (year(a.AdvanceDate)*10000 + month(a.AdvanceDate)*100 + day(a.AdvanceDate))) b 
+	on a.UserId = b.UserId
+	and a.AdvanceDate = b.AdvanceDate
+group by AccountId,a.MonitoringAccountId,a.UserCashAdvanceId,a.AdvanceDate,a.RepayDate,a.RepayMoved,a.Amount,TipAmount,
+UserCashAdvanceSubscriptionId, CashAdvanceStatus, DeliveryType, delivery_rev, ca_cost, a.UserId, SubDate, UserSubscriptionId;
+
+
+
+SELECT
+a.*,
+DateGenerated,
+UserCreditVariableId,
+FIRST_VALUE(DateGenerated) OVER(PARTITION BY a.UserId, AdvanceDate ORDER BY DateGenerated DESC) AS DateGenerated_last,
+case when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 1 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 1 then 'BruteForce'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 2 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 2 then 'DeepSearch'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 3 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 3 then 'Tagging'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 4 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 4 then 'VariableIncome'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 5 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 5 then 'SinglePaycheckAtEmpower'
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') = 7 or JSON_VALUE(PaycheckArchetype,'$.PaycheckModelUsed') = 7 then 'MinimalIncome'
+	else 'None'
+end AS [PaycheckModelUsed], 
+end AS PaycheckModelUsed, 
+MLModelScore,
+BalanceAverage, AverageMonthlySpend, TotalCash, AverageMonthlyIncome, Paycheck, Income, 
+OutstandingCompetitorBalance, PaycheckAccountCurrentBalance
+INTO #Advances_3
+from #Advances_2 a
+left join (select UserId, UserCreditVariableId, DateGenerated, PaycheckArchetype, MLModelScore,
+			BalanceAverage, AverageMonthlySpend, TotalCash, AverageMonthlyIncome, Paycheck, Income, 
+OutstandingCompetitorBalance, PaycheckAccountCurrentBalance
+	from UserCreditVariable with (nolock)
+	where (DateGenerated >= '2021-06-01' and DateGenerated < '2022-02-19' and CreditVariableEdition = 1)
+			or (DateGenerated >= '2022-02-19' and CreditVariableEdition = 2)
+	) b 
+on a.UserId = b.UserId 
+and DateGenerated < AdvanceDate
+and DateGenerated > DATEADD(Day,-5,AdvanceDate);
+
+
+
+CREATE TABLE #Advances_4
+(
+	AccountId int, MonitoringAccountId int, UserCashAdvanceId int,
+	AdvanceDate datetime, RepayDate datetime, RepayMoved int, Amount int,
+	TipAmount decimal(12,2), UserCashAdvanceSubscriptionId int,
+	CashAdvanceStatus varchar(15), DeliveryType int, delivery_rev int,
+	ca_cost int, UserId int, SubDate datetime, UserSubscriptionId int,
+	advance_number int,
+	DateGenerated datetime, UserCreditVariableId int, DateGenerated_last datetime,
+	PaycheckModelUsed varchar(30),MLModelScore decimal (12,10)
+);
+and DateGenerated > DATEADD(Day,-5,AdvanceDate)
+and AdvanceDate < '2022-04-01';
+
+--drop table #new_models;
+select 
+a.UserCashAdvanceId, c.UserCreditVariableId, c.MLModelScore as Helium, d.MLModelScore as Lithium,
+c.BalanceAverage, c.AverageMonthlySpend, c.TotalCash, c.AverageMonthlyIncome, c.Paycheck, c.Income, 
+c.OutstandingCompetitorBalance, c.PaycheckAccountCurrentBalance, 
+JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') as PaycheckModelUsed
+INTO #new_models
+from #Advances_2 a 
+left join UserCashAdvanceCreditVariable b 
+	on a.UserCashAdvanceId = b.UserCashAdvanceId
+left join UserCreditVariable c 
+	on b.UserCreditVariableId = c.UserCreditVariableId
+left join UserCreditVariableLithium d 
+	on b.UserCreditVariableId = d.UserCreditVariableId
+where AdvanceDate >= '2022-04-01';
+
+Update a
+set a.UserCreditVariableId = b.UserCreditVariableId,
+a.BalanceAverage = b.BalanceAverage,
+a.AverageMonthlySpend = b.AverageMonthlySpend,
+a.TotalCash = b.TotalCash, 
+a.AverageMonthlyIncome = b.AverageMonthlyIncome,
+a.Paycheck = b.Paycheck,
+a.Income = b.Income,
+a.OutstandingCompetitorBalance = b.OutstandingCompetitorBalance,
+a.PaycheckAccountCurrentBalance = b.PaycheckAccountCurrentBalance,
+a.PaycheckModelUsed = case when b.PaycheckModelUsed = 1 then 'Bruteforce'  when b.PaycheckModelUsed = 4 then 'VariableIncome' 
+					  when b.PaycheckModelUsed = 7 then 'MinimalIncome' else 'None' end
+from #Advances_3 a 
+left join #new_models b on a.UserCashAdvanceId = b.UserCashAdvanceId;
+
+Update a
+set a.MLModelScore = b.Helium
+from #Advances_3 a 
+left join #new_models b on a.UserCashAdvanceId = b.UserCashAdvanceId
+where a.AdvanceDate >= '2022-04-01' and a.AdvanceDate <= '2022-10-25';
+
+Update a
+set a.MLModelScore = b.Lithium
+from #Advances_3 a 
+left join #new_models b on a.UserCashAdvanceId = b.UserCashAdvanceId
+where a.AdvanceDate >= '2022-10-25';
+
+
+--drop table #Advances_4;
+SELECT
+a.*
+INTO #Advances_4
+from #Advances_3 a
+where (DateGenerated = DateGenerated_last or DateGenerated is null);
+
+select a.*,
+case when MLModelScore is null then 'null'
+	 when MLModelScore <= .03 then '<3%'
+	 when MLModelScore <= .01 then '<1%'
+	 when MLModelScore <= .03 then '1%-3%'
+	 when MLModelScore <= .05 then '3%-5%'
+	 when MLModelScore <= .07 then '5%-7%'
+	 when MLModelScore <= .10 then '5%-10%'
+	 when MLModelScore <= .15 then '10%-15%'
+	 when MLModelScore <= .20 then '15%-20%'
+	 when MLModelScore <= .25 then '20%-25%'
+	 when MLModelScore <= .30 then '25%-30%'
+	 when MLModelScore > .30 then '>30%'
+	 when MLModelScore > .25 then '>25%'
+    end as Hydrogen_bucket,
+d.Name as InstitutionName,
+case when d.ExternalProviderId in  ('ins_110730','ins_116831','ins_117321','ins_113967','ins_125234','ins_117881','ins_35','ins_117179','ins_126340',
+				'ins_118390','ins_100007','ins_24','ins_116185','ins_126339','ins_115614','ins_129229'
+				,'ins_115640','ins_111998','ins_54','ins_117416','ins_129417','ins_115686') then 1
+	 else 0
+	 end as IsRestrictedEligibilityInstitution
+Into #Advances_Inst
+from #Advances_4 a
+left join Account b 
+on a.MonitoringAccountId = b.AccountId
+left join InstitutionAccount c
+on b.InstitutionAccountId = c.InstitutionAccountId
+left join Institution d 
+on c.InstitutionIdentifier = d.InstitutionId;
+select 
+UserId, UserCashAdvanceId, AdvanceDate, RepayDate, RepayMoved,  Amount,TipAmount,CashAdvanceStatus,DeliveryType,delivery_rev,ca_cost,SubDate,
+advance_number, InstitutionName, IsRestrictedEligibilityInstitution, PaycheckModelUsed,MLModelScore, 
+BalanceAverage, AverageMonthlySpend, TotalCash, AverageMonthlyIncome, Paycheck, Income, 
+	OutstandingCompetitorBalance, PaycheckAccountCurrentBalance, Hydrogen_bucket,
+case when Amount = 25 and (Hydrogen_bucket = '<3%') and advance_number = 1 then .04
+    when Amount = 25 and (Hydrogen_bucket = '<3%') and advance_number <= 5 then .04
+    when Amount = 25 and (Hydrogen_bucket = '<3%') and advance_number >5 then .04
+
+    when Amount = 25 and (Hydrogen_bucket = '3%-5%') and advance_number = 1 then .04
+    when Amount = 25 and (Hydrogen_bucket = '3%-5%') and advance_number <= 5 then .04
+    when Amount = 25 and (Hydrogen_bucket = '3%-5%') and advance_number >5 then .04
+
+    when Amount = 25 and Hydrogen_bucket = '5%-10%' and advance_number = 1 then .10
+    when Amount = 25 and Hydrogen_bucket = '5%-10%' and advance_number <= 5 then .081
+    when Amount = 25 and Hydrogen_bucket = '5%-10%' and advance_number >5 then .051
+
+    when Amount = 25 and Hydrogen_bucket = '10%-15%' and advance_number = 1 then .105
+    when Amount = 25 and Hydrogen_bucket = '10%-15%' and advance_number <= 5 then .126
+    when Amount = 25 and Hydrogen_bucket = '10%-15%' and advance_number >5 then .10
+
+    when Amount = 25 and Hydrogen_bucket = '15%-20%' and advance_number = 1 then .151
+    when Amount = 25 and Hydrogen_bucket = '15%-20%' and advance_number <= 5 then .16
+    when Amount = 25 and Hydrogen_bucket = '15%-20%' and advance_number >5 then .102
+
+    when Amount = 25 and Hydrogen_bucket = '20%-25%' and advance_number = 1 then .183
+    when Amount = 25 and Hydrogen_bucket = '20%-25%' and advance_number <= 5 then .183
+    when Amount = 25 and Hydrogen_bucket = '20%-25%' and advance_number >5 then .183  --Adjusted from 10.5% to 12%
+
+    when Amount = 25 and Hydrogen_bucket = '25%-30%' and advance_number = 1 then .148 ---added
+    when Amount = 25 and Hydrogen_bucket = '25%-30%' and advance_number <= 5 then .148 
+    when Amount = 25 and Hydrogen_bucket = '25%-30%' and advance_number >5 then .148
+
+    when Amount = 25 and Hydrogen_bucket = '>30%' then .35 --assumed based on rough estimate
+
+-----------------------------------------------------
+    when Amount = 50 and (Hydrogen_bucket = '<3%') and advance_number = 1 then .016
+    when Amount = 50 and (Hydrogen_bucket = '<3%') and advance_number <= 5 then .016
+    when Amount = 50 and (Hydrogen_bucket = '<3%') and advance_number >5 then .014
+
+    when Amount = 50 and (Hydrogen_bucket = '3%-5%') and advance_number = 1 then .037
+    when Amount = 50 and (Hydrogen_bucket = '3%-5%') and advance_number <= 5 then .039
+    when Amount = 50 and (Hydrogen_bucket = '3%-5%') and advance_number >5 then .034
+
+    when Amount = 50 and Hydrogen_bucket = '5%-10%' and advance_number = 1 then .065
+    when Amount = 50 and Hydrogen_bucket = '5%-10%' and advance_number <= 5 then .065
+    when Amount = 50 and Hydrogen_bucket = '5%-10%' and advance_number >5 then .055
+
+    when Amount = 50 and Hydrogen_bucket = '10%-15%' and advance_number = 1 then .11
+    when Amount = 50 and Hydrogen_bucket = '10%-15%' and advance_number <= 5 then .11
+    when Amount = 50 and Hydrogen_bucket = '10%-15%' and advance_number >5 then .088
+
+    when Amount = 50 and Hydrogen_bucket = '15%-20%' and advance_number = 1 then .125 ---added
+    when Amount = 50 and Hydrogen_bucket = '15%-20%' and advance_number <= 5 then .125
+    when Amount = 50 and Hydrogen_bucket = '15%-20%' and advance_number >5 then .109
+    --matched the expectations from $25
+    when Amount = 50 and Hydrogen_bucket = '20%-25%' and advance_number = 1 then .141
+    when Amount = 50 and Hydrogen_bucket = '20%-25%' and advance_number <= 5 then .127
+    when Amount = 50 and Hydrogen_bucket = '20%-25%' and advance_number >5 then .099
+
+    when Amount = 50 and Hydrogen_bucket = '25%-30%' and advance_number = 1 then .147
+    when Amount = 50 and Hydrogen_bucket = '25%-30%' and advance_number <= 5 then .137
+    when Amount = 50 and Hydrogen_bucket = '25%-30%' and advance_number >5 then .111
+
+    when Amount = 50 and Hydrogen_bucket = '>30%' then .35 --assumed based on rough estimate
+
+    /*when Amount = 75 and Hydrogen_bucket = '5%-10%' and advance_number <= 5 then .053
+    when Amount = 75 and Hydrogen_bucket = '5%-10%' and advance_number >5 then .041
+    when Amount = 75 and Hydrogen_bucket = '10%-15%' and advance_number <= 5 then .09
+    when Amount = 75 and Hydrogen_bucket = '10%-15%' and advance_number >5 then .059
+    when Amount = 75 and Hydrogen_bucket = '15%-20%' and advance_number = 1 then .178 --added
+    when Amount = 75 and Hydrogen_bucket = '15%-20%' and advance_number <= 5 then .128
+    when Amount = 75 and Hydrogen_bucket = '15%-20%' and advance_number >5 then .077*/
+    ---Regrounded expected loss rates post Phase 3 using Dec 9th - Dec 17th advances
+    when Amount = 75 and (Hydrogen_bucket = '<3%') and advance_number = 1 then .028
+    when Amount = 75 and (Hydrogen_bucket = '<3%') and advance_number <= 5 then .021
+    when Amount = 75 and (Hydrogen_bucket = '<3%') and advance_number >5 then .019
+
+    when Amount = 75 and (Hydrogen_bucket = '3%-5%') and advance_number = 1 then .043
+    when Amount = 75 and (Hydrogen_bucket = '3%-5%') and advance_number <= 5 then .042
+    when Amount = 75 and (Hydrogen_bucket = '3%-5%') and advance_number >5 then .033
+
+    when Amount = 75 and Hydrogen_bucket = '5%-10%' and advance_number = 1 then .056
+    when Amount = 75 and Hydrogen_bucket = '5%-10%' and advance_number <= 5 then .07
+    when Amount = 75 and Hydrogen_bucket = '5%-10%' and advance_number >5 then .067
+
+    when Amount = 75 and Hydrogen_bucket = '10%-15%' and advance_number = 1 then .098
+    when Amount = 75 and Hydrogen_bucket = '10%-15%' and advance_number <= 5 then .110
+    when Amount = 75 and Hydrogen_bucket = '10%-15%' and advance_number >5 then .091
+
+--------------------------------------------
+    when Amount = 100 and (Hydrogen_bucket = '<3%') and advance_number = 1 then .018
+    when Amount = 100 and (Hydrogen_bucket = '<3%') and advance_number <= 5 then .023
+    when Amount = 100 and (Hydrogen_bucket = '<3%') and advance_number >5 then .017
+
+    when Amount = 100 and (Hydrogen_bucket = '3%-5%') and advance_number = 1 then .048
+    when Amount = 100 and (Hydrogen_bucket = '3%-5%') and advance_number <= 5 then .037
+    when Amount = 100 and (Hydrogen_bucket = '3%-5%') and advance_number >5 then .039
+
+    when Amount = 100 and Hydrogen_bucket = '5%-10%' and advance_number = 1 then .1
+    when Amount = 100 and Hydrogen_bucket = '5%-10%' and advance_number <= 5 then .052
+    when Amount = 100 and Hydrogen_bucket = '5%-10%' and advance_number >5 then .065
+
+
+    when Amount = 200 and (Hydrogen_bucket = '<3%' or Hydrogen_bucket = '3%-5%') then .012
+    when Amount = 250 and (Hydrogen_bucket = '<3%' or Hydrogen_bucket = '3%-5%') then .012
+    when Amount > 50 and Hydrogen_bucket != 'null' then .10
+
+    when Amount = 10 and (Hydrogen_bucket = '<3%')  then .036
+    when Amount = 10 and (Hydrogen_bucket = '3%-5%') then .036
+    when Amount = 10 and Hydrogen_bucket = '5%-10%'  then .0528
+    when Amount = 10 and Hydrogen_bucket = '10%-15%'  then .081
+    when Amount = 10 and Hydrogen_bucket = '15%-20%' then .1092
+    when Amount = 10 and Hydrogen_bucket = '20%-25%' then .1224
+    when Amount = 10 and Hydrogen_bucket = '25%-30%'  then .138
+    when Amount = 10 and Hydrogen_bucket = '>30%' then .18 --assumed based on rough estimate
+    end as risk_expectation
+.04 as risk_expectation
+INTO #Advances_5
+from #Advances_Inst; 
+
+SELECT
+a.*,
+c.DateSubmitted as Ach_dt,
+FIRST_VALUE(DateSubmitted) OVER(PARTITION BY a.UserCashAdvanceId ORDER BY DateSubmitted DESC) AS Last_Ach_dt,
+c.Status as Ach_status,
+d.CreatedAt as Stripe_dt,
+FIRST_VALUE(CreatedAt) OVER(PARTITION BY a.UserCashAdvanceId ORDER BY CreatedAt DESC) AS Last_Stripe_dt,
+d.Status as Stripe_status
+into #Advances_6
+FROM #Advances_5 a 
+	LEFT JOIN (
+		SELECT
+			UserCashAdvanceId,DateSubmitted, 
+			case when [Status] = 0 then 'pending'
+				 when [Status] = 1 then 'canceled'
+				 when [Status] = 2 then 'processing'
+				 when [Status] = 3 then 'hold'
+				 when [Status] = 4 then 'succeeded'
+				 when [Status] = 5 then 'failed'
+				 when [Status] = 6 then 'corrected' end as [Status]
+		FROM UserCashAdvanceAchTransactions a with (nolock)
+			INNER JOIN AchTransactions b ON a.AchTransactionID = b.AchTransactionID
+		WHERE
+			IsDistribution = 0) c ON a.UserCashAdvanceId = c.UserCashAdvanceId
+	LEFT JOIN (
+		SELECT
+			UserCashAdvanceId,CreatedAt, 
+			case when [Status] = 0 then 'pending'
+				 when [Status] = 1 then 'succeeded'
+				 when [Status] = 2 then 'failed' end as [Status]
+		FROM UserCashAdvanceStripeTransactions A with (nolock)
+			INNER JOIN StripeTransactions B ON A.StripeTransactionId = B.StripeTransactionId
+		WHERE
+			IsDistribution = 0) d ON a.UserCashAdvanceId = d.UserCashAdvanceId;
+SELECT * 
+into #Advances_7
+from #Advances_6
+where (Last_Ach_dt = Ach_dt or Last_Ach_dt is null) and (Last_Stripe_dt = Stripe_dt or Last_Stripe_dt is null)
+group by UserId, UserCashAdvanceId, AdvanceDate, RepayDate, RepayMoved, Amount,TipAmount,CashAdvanceStatus,DeliveryType,delivery_rev,
+ca_cost,SubDate,advance_number, InstitutionName, IsRestrictedEligibilityInstitution, PaycheckModelUsed,MLModelScore, 
+BalanceAverage, AverageMonthlySpend, TotalCash, AverageMonthlyIncome, Paycheck, Income, 
+OutstandingCompetitorBalance, PaycheckAccountCurrentBalance,Hydrogen_bucket,
+risk_expectation, Ach_dt, Last_Ach_dt, Ach_status, Stripe_dt, Last_Stripe_dt, Stripe_status;
+------
+select 
+a.*,
+case when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt < (RepayDate + 1) then 'On time'
+when Stripe_status = 'succeeded' and Stripe_dt < (RepayDate + 1) then 'On time'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 7) then '1-7 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 7) then '1-7 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 14) then '8-14 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 14) then '8-14 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 28) then '15-28 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 28) then '15-28 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt > (RepayDate + 28) then '>28 late'
+when Stripe_status = 'succeeded' and Stripe_dt > (RepayDate + 28) then '>28 late'
+when Stripe_status = 'pending' or Ach_status = 'pending' then 'pending'
+when Ach_status = 'processing' then 'processing'
+when Stripe_status = 'failed' or Ach_status = 'failed' then 'failed'
+else Ach_status
+end as payment_status
+Into #Advances_8
+from #Advances_7 a;
+CREATE TABLE #First_advances_pre
+(
+	UserId int,
+	AdvanceDate datetime,
+	Amount int,
+	SubDate datetime,
+	UserSubscriptionId int,
+	MLModelScore decimal (12,10),
+	InvoiceDate datetime,
+	InvoiceStatus varchar(15),
+	UserSubscriptionInvoiceid int,
+	best_Sub_inv_id int
+);
+INSERT INTO #First_advances_pre
+select
+a.UserId,
+a.AdvanceDate,
+a.Amount,
+a.SubDate,
+a.UserSubscriptionId,
+a.MLModelScore,
+InvoiceDate,
+case when InvoiceStatus in (0,1) then 'pending'
+when InvoiceStatus in (2) then 'paid'
+when InvoiceStatus in (3,4,5,6) then 'unpaid'
+end as InvoiceStatus,
+UserSubscriptionInvoiceid,
+FIRST_VALUE(UserSubscriptionInvoiceid) OVER(PARTITION BY a.UserId, year(InvoiceDate)*100 + month(InvoiceDate) 
+		ORDER BY case when InvoiceStatus = 2 then 1 else 0 end DESC, UserSubscriptionInvoiceid DESC) AS best_Sub_inv_id
+from #Advances_4 a
+left join [UserSubscriptionInvoice] b
+on a.UserSubscriptionId = b.UserSubscriptionId
+and (year(b.InvoiceDate)*100 + month(b.InvoiceDate)) >= (year(a.AdvanceDate)*100 + month(a.AdvanceDate))
+where advance_number = 1;
+select * 
+INTO #First_advances
+from #First_advances_pre 
+where UserSubscriptionInvoiceid = best_Sub_inv_id;
+CREATE TABLE #UsersNoSubMonth1
+(
+	UserId int,
+	AdvanceDate datetime,
+	Amount int,
+	SubDate datetime,
+	UserSubscriptionId int,
+	MLModelScore decimal (12,10),
+	UserSubscriptionInvoiceid int,
+	best_Sub_inv_id int
+);
+INSERT INTO #UsersNoSubMonth1
+select
+a.UserId,
+a.AdvanceDate,
+a.Amount,
+a.SubDate,
+a.UserSubscriptionId,
+a.MLModelScore,
+a.UserSubscriptionInvoiceid,
+a.best_Sub_inv_id
+from #First_advances a
+left join (select UserId, first_invoice_dt 
+			from (select UserId, 
+				FIRST_VALUE(InvoiceDate) OVER(PARTITION BY UserId ORDER BY InvoiceDate ASC) AS first_invoice_dt
+				from #First_advances
+				) b  
+			group by UserId, first_invoice_dt) b
+on a.UserId = b.UserId
+where ((year(a.AdvanceDate)*100 + month(a.AdvanceDate)) < (year(b.first_invoice_dt)*100 + month(b.first_invoice_dt)) or first_invoice_dt is null)
+group by a.UserId,a.AdvanceDate,a.Amount,a.SubDate,a.UserSubscriptionId,a.MLModelScore,a.UserSubscriptionInvoiceid,a.best_Sub_inv_id;
+INSERT INTO #First_advances
+select
+UserId,
+AdvanceDate,
+Amount,
+SubDate,
+UserSubscriptionId,
+MLModelScore,
+AdvanceDate as InvoiceDate,
+'unpaid' as InvoiceStatus,
+UserSubscriptionInvoiceid,
+best_Sub_inv_id
+from #UsersNoSubMonth1
+select 
+a.*, case when b.UserId is not null then 'test' else 'standard' end as offer_test_flag
+INTO #First_advances_test
+from #First_advances a 
+left join (select UserId
+		from UserCashAdvanceEligibility a 
+		inner join UserCreditVariable b 
+		on a.UserCreditVariableId = b.UserCreditVariableId
+		where CreditPolicy = 6 and EligibilityCreatedAt > '2022-04-01' and EligibilityCreatedAt < '2022-04-23'
+		group by UserId) b 
+on a.UserId = b.UserId;
+CREATE TABLE #Valuations_Driver
+(
+	UserId int,
+	AdvanceDate datetime,
+	Amount int,
+	SubDate datetime,
+	UserSubscriptionId int,
+	MLModelScore decimal (12,10),
+	offer_test_flag varchar(15),
+	InvoiceDate datetime,
+	InvoiceStatus varchar(15),
+	sub_rev decimal(12,2),
+	CA_losses decimal(12,2),
+	CA_transfer_rev decimal(12,2),
+	CA_cost int,
+	CA_tips decimal(12,2),
+	CA_num int,
+	CA_amt decimal(12,2),
+	CA_COF decimal(12,2)
+);
+INSERT INTO #Valuations_Driver
+select
+a.UserId,
+a.AdvanceDate,
+a.Amount,
+a.SubDate,
+a.UserSubscriptionId,
+a.MLModelScore,
+a.offer_test_flag,
+a.InvoiceDate,
+a.InvoiceStatus,
+case when InvoiceStatus = 'paid' then 8 else 0 end as sub_rev,
+sum(case when b.payment_status = 'failed' then b.Amount 
+	when b.payment_status is null and (CashAdvanceStatus = 'default' or CashAdvanceStatus = 'error') then b.Amount
+	else 0 end) as CA_losses,
+sum(case when b.Amount is not null then b.delivery_rev else 0 end) as CA_transfer_rev,
+sum(case when b.Amount is not null then b.ca_cost else 0 end) as CA_cost,
+sum(case when b.Amount is not null then b.TipAmount else 0 end) as CA_tips,
+sum(case when b.Amount is not null then 1 else 0 end) as CA_num,
+sum(case when b.Amount is not null then b.Amount else 0 end) as CA_amt,
+sum(case when b.Amount is not null then b.Amount*.002 else 0 end) as CA_COF
+from #First_advances_test a
+left join #Advances_8 b
+on a.UserId = b.UserId
+and(year(a.InvoiceDate)*100 + month(a.InvoiceDate)) = (year(b.AdvanceDate)*100 + month(b.AdvanceDate))
+group by a.UserId, a.AdvanceDate, a.Amount, a.SubDate, a.UserSubscriptionId,InvoiceDate,InvoiceStatus, a.MLModelScore, a.offer_test_flag;
+----Retention & Cancel Monitoring
+--drop table #NewSubs;
+select 
+a.UserId,
+AccountId,
+UserSubscriptionId,
+StartDate,
+EndDate,
+SubscriptionStatus,
+DateGenerated,
+UserCreditVariableId,
+case when DateGenerated is null then 10
+	when JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') is null then 9
+	else JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') end
+	as PaycheckArchetype,
+case when MLModelScore = 0 then 0 else 1 end as model_zero_flag,
+MLModelScore
+INTO #NewSubs
+from UserSubscription a
+left join UserCreditVariable b with (nolock)
+on a.UserId = b.UserId
+and DateGenerated < DATEADD(Hour,1,StartDate)
+and DateGenerated > DATEADD(Hour,-1,StartDate)
+where StartDate > '2021-10-01';
+where StartDate > '2021-10-01' and StartDate < '2022-10-25';
+
+--drop table #NewSubs2;
+select 
+a.*, AmountEligible, CreditPolicy , EligibilityCreatedAt, UserCashAdvanceEligibilityId,
+FIRST_VALUE(a.UserCreditVariableId) OVER(PARTITION BY UserId, StartDate 
+		ORDER BY AmountEligible DESC, EligibilityCreatedAt ASC) AS Best_UCV_ID,
+FIRST_VALUE(UserCashAdvanceEligibilityId) OVER(PARTITION BY UserId, StartDate 
+		ORDER BY AmountEligible DESC, EligibilityCreatedAt ASC) AS Best_Elig_ID
+INTO #NewSubs2
+from #NewSubs a
+left join UserCashAdvanceEligibility b 
+on a.UserCreditVariableId = b.UserCreditVariableId;
+--drop table #NewSubs3;
+select *
+INTO #NewSubs3
+from #NewSubs2 
+where (UserCreditVariableId = Best_UCV_ID and UserCashAdvanceEligibilityId = Best_Elig_ID)
+	or UserCreditVariableId is null
+
+--drop table #NewSubs4;
+--drop table #NewSubs4_pre;
+select 
+a.*,
+case when b.UserSubscriptionId = a.UserSubscriptionId then 0 else 1 end as resub_flag
+INTO #NewSubs4
+INTO #NewSubs4_pre
+from #NewSubs3 a 
+left join (select UserId, min(UserSubscriptionId) as UserSubscriptionId
+		  from UserSubscription
+		  group by UserId) b
+on a.UserId = b.UserId;
+
+--drop table #NewSubs_lithium;
+select 
+a.UserId,
+AccountId,
+UserSubscriptionId,
+StartDate,
+EndDate,
+SubscriptionStatus,
+ActualAnalysisDateUtc,
+UserCreditVariableId,
+case when ActualAnalysisDateUtc is null then 10
+	when PaycheckIdentificationMethod is null then 9
+	else PaycheckIdentificationMethod end
+	as PaycheckArchetype,
+case when MLModelScore = 0 then 0 else 1 end as model_zero_flag,
+MLModelScore
+INTO #NewSubs_lithium
+from UserSubscription a
+left join UserCreditVariableLithium b with (nolock)
+on a.UserId = b.UserId
+and ActualAnalysisDateUtc < DATEADD(Hour,1,StartDate)
+and ActualAnalysisDateUtc > DATEADD(Hour,-1,StartDate)
+where StartDate > '2022-10-25';
+
+--drop table #NewSubs_lithium2;
+select 
+a.*, AmountEligible, CreditPolicy , EligibilityCreatedAt, UserCashAdvanceEligibilityId,
+FIRST_VALUE(a.UserCreditVariableId) OVER(PARTITION BY UserId, StartDate 
+		ORDER BY AmountEligible DESC, EligibilityCreatedAt ASC) AS Best_UCV_ID,
+FIRST_VALUE(UserCashAdvanceEligibilityId) OVER(PARTITION BY UserId, StartDate 
+		ORDER BY AmountEligible DESC, EligibilityCreatedAt ASC) AS Best_Elig_ID
+INTO #NewSubs_lithium2
+from #NewSubs_lithium a
+left join UserCashAdvanceEligibility b 
+on a.UserCreditVariableId = b.UserCreditVariableId;
+
+--drop table #NewSubs_lithium3;
+select *
+INTO #NewSubs_lithium3
+from #NewSubs_lithium2 
+where (UserCreditVariableId = Best_UCV_ID and UserCashAdvanceEligibilityId = Best_Elig_ID)
+	or UserCreditVariableId is null
+
+--drop table #NewSubs_lithium4;
+select 
+a.*,
+case when b.UserSubscriptionId = a.UserSubscriptionId then 0 else 1 end as resub_flag
+INTO #NewSubs_lithium4
+from #NewSubs_lithium3 a 
+left join (select UserId, min(UserSubscriptionId) as UserSubscriptionId
+		  from UserSubscription
+		  group by UserId) b
+on a.UserId = b.UserId;
+
+SELECT a.* INTO #NewSubs4 FROM (
+select * from #NewSubs4_pre union select * from #NewSubs_lithium4
+) as a
+
+CREATE TABLE #Oct_plus_Advances
+(
+	AccountId int, AdvanceDate datetime,
+	Amount int, UserCashAdvanceSubscriptionId int,
+	CashAdvanceStatus varchar(15), DeliveryType int, UserId int
+);
+INSERT INTO #Oct_plus_Advances
+SELECT
+a.AccountId,
+a.AdvanceDate,
+a.Amount,
+a.UserCashAdvanceSubscriptionId,
+CashAdvanceStatus,
+DeliveryType,
+b.UserId
+from [UserCashAdvance] a
+inner join [UserCashAdvanceSubscription] b 
+on a.UserCashAdvanceSubscriptionId = b.UserCashAdvanceSubscriptionId 
+where AdvanceDate >= '2021-10-01'
+and CashAdvanceStatus in (1,2,3,4,5,7,8);
+CREATE TABLE #NewSubs_Final_Driver
+(
+	UserId int, StartDate datetime, EndDate datetime, PaycheckArchetype int,
+	MLModelScore decimal (12,8), AmountEligible int, CreditPolicy int, resub_flag int, 
+	day_1_adv_flag int, day_14_adv_flag int, M1_paid_flag int, M2_paid_flag int
+	
+);
+INSERT INTO #NewSubs_Final_Driver
+select 
+a.UserId, a.StartDate, EndDate, PaycheckArchetype, MLModelScore, 
+AmountEligible, CreditPolicy, resub_flag,
+case when b.UserId is not null then 1 else 0 end as day_1_adv_flag, 
+case when c.UserId is not null then 1 else 0 end as day_14_adv_flag,
+case when d.UserId is not null then 1 else 0 end as M1_paid_flag,
+case when e.UserId is not null then 1 else 0 end as M2_paid_flag
+from #NewSubs4 a 
+left join (select a.UserId, a.StartDate
+		   from #NewSubs4 a
+		   inner join #Oct_plus_Advances b
+		   on a.UserId = b.UserId 
+		   and AdvanceDate > DATEADD(Hour,-1,StartDate)
+		   and AdvanceDate < DATEADD(Day,1,StartDate)
+		   group by a.UserId, a.StartDate) b
+		on a.UserId = b.UserId 
+		and a.StartDate = b.StartDate
+left join (select a.UserId, a.StartDate
+		   from #NewSubs4 a
+		   inner join #Oct_plus_Advances b
+		   on a.UserId = b.UserId 
+		   and AdvanceDate > DATEADD(Hour,-1,StartDate)
+		   and AdvanceDate < DATEADD(Day,15,StartDate)
+		   group by a.UserId, a.StartDate) c
+		on a.UserId = c.UserId 
+		and a.StartDate = c.StartDate
+left join (select a.UserId, a.StartDate
+		   from #NewSubs4 a
+		   inner join UserSubscriptionInvoice b
+		   on a.UserSubscriptionId = b.UserSubscriptionId 
+		   and InvoiceDate <= DATEADD(Day,31,StartDate)
+		   and InvoiceStatus = 2
+		   group by a.UserId, a.StartDate) d
+		on a.UserId = d.UserId 
+		and a.StartDate = d.StartDate
+left join (select a.UserId, a.StartDate
+		   from #NewSubs4 a
+		   inner join UserSubscriptionInvoice b
+		   on a.UserSubscriptionId = b.UserSubscriptionId 
+		   and InvoiceDate > DATEADD(Day,31,StartDate)
+		   and InvoiceDate <= DATEADD(Day,62,StartDate)
+		   and InvoiceStatus = 2
+		   group by a.UserId, a.StartDate) e
+		on a.UserId = e.UserId 
+		and a.StartDate = e.StartDate;
+---CA Monitoring
+select 
+day(AdvanceDate) as Advance_day, 
+month(AdvanceDate) as Advance_month,
+year(AdvanceDate) as Advance_yr,
+day(RepayDate) as Repay_day,
+month(RepayDate) as Repay_month,
+year(RepayDate) as Repay_yr,
+RepayMoved,
+Amount as AdvanceAmount, DeliveryType,
+month(SubDate) as Sub_month,
+year(SubDate) as Sub_yr,
+case when advance_number = 1 then '1'
+	when advance_number <= 5 then '2-5'
+	else '5+' end as advance_number,
+Hydrogen_bucket,
+IsRestrictedEligibilityInstitution,
+PaycheckModelUsed,
+case when MLModelScore = 0 or MLModelScore is null then 'null'
+	 when MLModelScore < .02 then '<2%'
+	 when MLModelScore < .03 then '2%-3%'
+	 when MLModelScore < .05 then '3%-5%'
+	 when MLModelScore < .12 then '5%-12%'
+	 when MLModelScore < .17 then '12%-17%'
+	 when MLModelScore < .25 then '17%-25%'
+	 when MLModelScore >= .25 then '>25%'
+end as Hydrogen_bucket_CP,
+case when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt < (RepayDate + 1) then 'On time'
+when Stripe_status = 'succeeded' and Stripe_dt < (RepayDate + 1) then 'On time'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 7) then '1-7 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 7) then '1-7 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 14) then '8-14 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 14) then '8-14 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 28) then '15-28 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 28) then '15-28 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 45) then '29-45 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 45) then '29-45 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt > (RepayDate + 45) then '>45 late'
+when Stripe_status = 'succeeded' and Stripe_dt > (RepayDate + 45) then '>45 late'
+when Stripe_status = 'pending' or Ach_status = 'pending' then 'pending'
+when Ach_status = 'processing' then 'processing'
+when Stripe_status = 'failed' or Ach_status = 'failed' then 'failed'
+else Ach_status
+end as payment_status,
+case when InstitutionName in ('Chime', 'Bank of America', 'Chase', 'Wells Fargo', 'Navy Federal Credit Union', 'Empower', 'USAA', 'US Bank', 'Woodforest National Bank', 'Capital One', 'Varo Bank') then InstitutionName else 'other' end as InstitutionName,
+sum(case when CashAdvanceStatus = 'default' then Amount else 0 end) as default_amt,
+sum(Amount) as advance_sum,
+sum(TipAmount) as tip_sum,
+sum(delivery_rev) as delivery_rev,
+sum(case when CashAdvanceStatus = 'default' then 1 else 0 end) as default_ct,
+sum(risk_expectation) as risk_expectation,
+sum(risk_expectation*Amount) as risk_expectation_sum,
+sum(case when BalanceAverage is null then 0 when BalanceAverage <-2000 then -2000 
+	when BalanceAverage >10000 then 10000 else BalanceAverage end) as BalanceAverage,
+sum(case when AverageMonthlySpend is null then -1000 when AverageMonthlySpend <-10000 then -10000 
+	when AverageMonthlySpend >=0 then 0 else AverageMonthlySpend end) as AverageMonthlySpend,	
+sum(case when TotalCash is null then 0 when TotalCash <-2000 then -2000 
+	when TotalCash >10000 then 10000 else TotalCash end) as TotalCash,
+sum(case when PaycheckAccountCurrentBalance is null then 0 when PaycheckAccountCurrentBalance <-2000 then -2000 
+	when PaycheckAccountCurrentBalance >10000 then 10000 else PaycheckAccountCurrentBalance end) as PaycheckAccountCurrentBalance,
+sum(case when AverageMonthlyIncome is null then 0 when AverageMonthlyIncome <0 then 0 
+	when AverageMonthlyIncome >15000 then 15000 else AverageMonthlyIncome end) as AverageMonthlyIncome,	
+sum(case when Paycheck is null then 0 when Paycheck <0 then 0 
+	when Paycheck >15000 then 15000 else Paycheck end) as Paycheck,	
+sum(case when Income is null then 0 when Income <0 then 0 
+	when Income >15000 then 15000 else Income end) as Income,
+sum(case when OutstandingCompetitorBalance is null then 0 when OutstandingCompetitorBalance <0 then 0
+	when OutstandingCompetitorBalance >1000 then 1000 else OutstandingCompetitorBalance end) as OutstandingCompetitorBalance,
+count(*) as advance_ct
+from #Advances_7
+group by day(AdvanceDate), month(AdvanceDate), year(AdvanceDate), day(RepayDate), month(RepayDate), year(RepayDate), RepayMoved,
+Amount, month(SubDate), year(SubDate), Hydrogen_bucket, DeliveryType, IsRestrictedEligibilityInstitution, PaycheckModelUsed,
+case when advance_number = 1 then '1' when advance_number <= 5 then '2-5' else '5+' end,
+case when MLModelScore = 0 or MLModelScore is null then 'null' when MLModelScore < .02 then '<2%'
+when MLModelScore < .03 then '2%-3%' when MLModelScore < .05 then '3%-5%' when MLModelScore < .12 then '5%-12%'
+when MLModelScore < .17 then '12%-17%' when MLModelScore < .25 then '17%-25%' when MLModelScore >= .25 then '>25%' end,
+case when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt < (RepayDate + 1) then 'On time'
+when Stripe_status = 'succeeded' and Stripe_dt < (RepayDate + 1) then 'On time'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 7) then '1-7 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 7) then '1-7 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 14) then '8-14 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 14) then '8-14 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 28) then '15-28 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 28) then '15-28 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt <= (RepayDate + 45) then '29-45 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= (RepayDate + 45) then '29-45 late'
+when (Ach_status = 'succeeded' or Ach_status = 'corrected') and Ach_dt > (RepayDate + 45) then '>45 late'
+when Stripe_status = 'succeeded' and Stripe_dt > (RepayDate + 45) then '>45 late'
+when Stripe_status = 'pending' or Ach_status = 'pending' then 'pending'
+when Ach_status = 'processing' then 'processing'
+when Stripe_status = 'failed' or Ach_status = 'failed' then 'failed' else Ach_status end,
+case when InstitutionName in ('Chime', 'Bank of America', 'Chase', 'Wells Fargo', 'Navy Federal Credit Union', 'Empower', 'USAA', 'US Bank', 'Woodforest National Bank', 'Capital One', 'Varo Bank') then InstitutionName else 'other' end
+   
+    
+---Valuations Monitoring
+select 
+day(AdvanceDate) as Advance_day, 
+month(AdvanceDate) as Advance_month,
+year(AdvanceDate) as Advance_yr,
+month(SubDate) as Sub_month,
+year(SubDate) as Sub_yr,
+month(InvoiceDate) as stmt_month,
+year(InvoiceDate) as stmt_yr,
+case when MLModelScore = 0 or MLModelScore is null then 'null'
+when MLModelScore < .01 then '1%' when MLModelScore < .02 then '2%' when MLModelScore < .03 then '3%' when MLModelScore < .04 then '4%' when MLModelScore < .05 then '5%'
+when MLModelScore < .06 then '6%' when MLModelScore < .07 then '7%' when MLModelScore < .08 then '8%' when MLModelScore < .09 then '9%' when MLModelScore < .10 then '10%'
+when MLModelScore < .11 then '11%' when MLModelScore < .12 then '12%' when MLModelScore < .13 then '13%' when MLModelScore < .14 then '14%' when MLModelScore < .15 then '15%'
+when MLModelScore < .16 then '16%' when MLModelScore < .17 then '17%' when MLModelScore < .18 then '18%' when MLModelScore < .19 then '19%' when MLModelScore < .20 then '20%'
+when MLModelScore < .21 then '21%' when MLModelScore < .22 then '22%' when MLModelScore < .23 then '23%' when MLModelScore < .24 then '24%' when MLModelScore < .25 then '25%'
+when MLModelScore >.25 then '>25%' end as Hydrogen_bucket,
+when MLModelScore < .26 then '26%' when MLModelScore < .27 then '27%' when MLModelScore < .28 then '28%' when MLModelScore < .29 then '29%' when MLModelScore < .30 then '30%'
+when MLModelScore >.30 then '>30%' end as Hydrogen_bucket,
+Amount as AdvanceAmount,
+sum(sub_rev) as sub_rev,
+sum(CA_losses) as CA_losses,
+sum(CA_transfer_rev) as CA_transfer_rev,
+sum(CA_cost) as CA_cost,
+sum(CA_tips) as CA_tips,
+sum(CA_num) as CA_num,
+sum(CA_amt) as CA_amt,
+sum(CA_COF) as CA_COF,
+count(*) as open_users
+from #Valuations_Driver
+group by day(AdvanceDate), month(AdvanceDate), year(AdvanceDate), Amount, 
+    month(SubDate), year(SubDate), month(InvoiceDate), year(InvoiceDate),
+case when MLModelScore = 0 or MLModelScore is null then 'null'
+when MLModelScore < .01 then '1%' when MLModelScore < .02 then '2%' when MLModelScore < .03 then '3%' when MLModelScore < .04 then '4%' when MLModelScore < .05 then '5%'
+when MLModelScore < .06 then '6%' when MLModelScore < .07 then '7%' when MLModelScore < .08 then '8%' when MLModelScore < .09 then '9%' when MLModelScore < .10 then '10%'
+when MLModelScore < .11 then '11%' when MLModelScore < .12 then '12%' when MLModelScore < .13 then '13%' when MLModelScore < .14 then '14%' when MLModelScore < .15 then '15%'
+when MLModelScore < .16 then '16%' when MLModelScore < .17 then '17%' when MLModelScore < .18 then '18%' when MLModelScore < .19 then '19%' when MLModelScore < .20 then '20%'
+when MLModelScore < .21 then '21%' when MLModelScore < .22 then '22%' when MLModelScore < .23 then '23%' when MLModelScore < .24 then '24%' when MLModelScore < .25 then '25%'
+when MLModelScore >.25 then '>25%' end
+when MLModelScore < .26 then '26%' when MLModelScore < .27 then '27%' when MLModelScore < .28 then '28%' when MLModelScore < .29 then '29%' when MLModelScore < .30 then '30%'
+when MLModelScore >.30 then '>30%' end
