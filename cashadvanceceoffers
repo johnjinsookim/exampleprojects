@@ -1,0 +1,132 @@
+/*** Goal: understand how changes in $ CA amount over time affects retention ***/
+
+
+---- Create temp table #advanceSortDesc ----
+-- This table sorts advances by most recent first, then selects the largest advance taken by a user --
+
+DROP TABLE if exists #advanceSortDesc;
+SELECT 
+    -- From UserCashAdvance table -- 
+    AccountId, AdvanceDate, CashAdvanceStatus, largestAdvanceTaken, lastAdvanceTaken, AdvanceCount,
+    -- From UserCreditVariable table --
+    UserId, row_number() over(partition by UserID order by AdvanceDate desc) as row_num, 
+    OutstandingCompetitorBalance, ExpenseToIncomeRatioExTransfersLast90
+INTO #advanceSortDesc 
+FROM UserCashAdvance as UCA
+INNER JOIN (
+    SELECT 
+        UserCashAdvanceSubscriptionId, 
+        MAX(Amount) as largestAdvanceTaken, 
+        MAX(AdvanceDate) as lastAdvanceTaken
+    FROM UserCashAdvance 
+    GROUP BY UserCashAdvanceSubscriptionId) as maxAdvance 
+    ON UCA.UserCashAdvanceSubscriptionid = maxAdvance.UserCashAdvanceSubscriptionid
+INNER JOIN UserCashAdvanceCreditVariable as UCCV
+    ON UCCV.UserCashAdvanceId = UCA.UserCashAdvanceId
+INNER JOIN UserCreditVariable as UCV
+    ON UCV.UserCreditVariableID = UCCV.UserCreditVariableID
+INNER JOIN (
+    SELECT UserCashAdvanceSubscriptionId as CAID, COUNT(DISTINCT UserCashAdvanceId) as AdvanceCount
+    FROM UserCashAdvance
+    GROUP BY UserCashAdvanceSubscriptionId) as AdvancesPerUser
+    ON UCA.UserCashAdvanceSubscriptionId = AdvancesPerUser.CAID
+WHERE (
+    -- Filter out pending and failed cash advance
+    CashAdvanceStatus <> 6
+);
+
+
+---- Create temp table #advanceSortAsc ----
+-- This table sorts advances by the very first received by the user -- 
+
+DROP TABLE if exists #advanceSortAsc;
+SELECT 
+    -- From UserCashAdvance table --
+    AccountId, AdvanceDate, CashAdvanceStatus, Amount,
+    -- From UserCreditVariable table --
+    UserId, row_number() over(partition by UserID order by AdvanceDate asc) as row_num,
+    OutstandingCompetitorBalance, ExpenseToIncomeRatioExTransfersLast90
+INTO #advanceSortAsc
+FROM UserCashAdvance as UCA
+INNER JOIN UserCashAdvanceCreditVariable as UCCV
+    ON UCCV.UserCashAdvanceId = UCA.UserCashAdvanceId
+INNER JOIN UserCreditVariable as UCV
+    ON UCV.UserCreditVariableID = UCCV.UserCreditVariableID
+WHERE (
+    -- Filter out pending and failed cash advance
+    CashAdvanceStatus <> 6
+);
+
+
+---- Create temp table #latestAdvance ----
+
+SELECT 
+    #advanceSortDesc.AccountId,
+    #advanceSortDesc.UserId,  
+    #advanceSortDesc.AdvanceDate, 
+    #advanceSortDesc.CashAdvanceStatus,
+    #advanceSortDesc.AdvanceCount,
+    #advanceSortDesc.lastAdvanceTaken, 
+    #advanceSortDesc.largestAdvancetaken,
+    #advanceSortDesc.OutstandingCompetitorBalance,
+    #advanceSortDesc.ExpenseToIncomeRatioExTransfersLast90
+INTO #latestAdvance
+FROM #advanceSortDesc
+WHERE(
+    -- Account for most relevant changes to credit policy, from March onwards
+    DATEPART(Year, AdvanceDate) = 2022
+    AND DATEPART (month, AdvanceDate) > 2
+    AND row_num = 1 
+);
+
+
+---- Create temp table #firstAdvance ----
+
+DROP TABLE if exists #firstAdvance
+SELECT
+    #advanceSortAsc.AccountId,
+    #advanceSortAsc.UserId,  
+    #advanceSortAsc.AdvanceDate,
+    #advanceSortAsc.Amount,
+    #advanceSortAsc.CashAdvanceStatus,
+    #advanceSortAsc.OutstandingCompetitorBalance,
+    #advanceSortAsc.ExpenseToIncomeRatioExTransfersLast90
+INTO #firstAdvance
+FROM #advanceSortAsc
+WHERE(
+    -- Account for most relevant changes to credit policy, for users taking first advance in March
+    DATEPART (Year, AdvanceDate) = 2022
+    AND DATEPART (month, AdvanceDate) = 3
+    AND row_num = 1 
+);
+
+
+---- Create temp table #totalAdvance ----
+-- Instruction #1: join temp tables to get output table of first advances in March with latest advance date -- 
+-- Instruction #2: input the fields you care about from the two temp tables, #firstAdvance and #latestAdvance -- 
+
+SELECT 
+    #firstAdvance.AdvanceDate as 'First Advance Date',
+    #firstAdvance.Amount as 'First Advance Amt.',
+    #firstAdvance.CashAdvanceStatus as 'First Advance Status',
+    #latestAdvance.AdvanceDate as 'Latest Advance', 
+    #latestAdvance.largestAdvanceTaken as 'Latest Advance Amt.',
+    #latestAdvance.CashAdvanceStatus as 'Latest Advance Status',
+    ((DATEPART(month, #latestAdvance.lastAdvanceTaken)) - (DATEPART(month, #firstAdvance.AdvanceDate))) as CAMonthsSubbed,
+    (#latestAdvance.largestAdvanceTaken - #firstAdvance.Amount) as 'Difference in Amt.',
+    #latestAdvance.AdvanceCount as 'Advance Count',
+    -- Ideally, this amount is negative if the user's financial situation has improved
+    ((#latestAdvance.ExpenseToIncomeRatioExTransfersLast90) - (#firstAdvance.ExpenseToIncomeRatioExTransfersLast90)) as 'Change in EIR', 
+    -- Ideally, this amount is not positive b/c that would mean higher probability of default with competitor
+    ((#latestAdvance.OutstandingCompetitorBalance) - (#firstAdvance.OutstandingCompetitorBalance)) as 'Change in OCB' 
+INTO #totalAdvance
+FROM #firstAdvance 
+INNER JOIN  #latestAdvance 
+    ON #firstAdvance.UserId = #latestAdvance.UserId
+;
+
+
+---- Return desired query output ----
+
+SELECT*
+FROM #totalAdvance
