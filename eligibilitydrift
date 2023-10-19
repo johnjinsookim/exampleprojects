@@ -1,0 +1,236 @@
+---- Runs a check; start query from the drop table function ----
+/* DOW eligibility */
+select 
+datepart(weekday,EligibilityCreatedAt) as EligibilityDOW,
+AmountEligible,
+count(*)
+from userCashAdvanceEligibility
+where EligibilityCreatedAt > '2022-08-21' and EligibilityCreatedAt < '2022-09-11'
+group by 
+datepart(weekday,EligibilityCreatedAt),
+AmountEligible
+order by
+datepart(weekday,EligibilityCreatedAt),
+AmountEligible
+​
+​
+---- Run query starting from here; for every 2 weeks, (latest eligibility - created eligibility) each day----​
+---- Take the max across the week and take the count of the # of times that a user's previous amount doesn't equal current amount ---- 
+---- UserID + subquery where previous amount and current amount are not equal COUNT(*) Previous Amount > Amount ---- 
+drop table #Eligibility1
+select 
+UserID, AmountEligible, EligibilityCreatedAt,
+--datepart(month,EligibilityCreatedAt) as EligibilityMonth,
+datepart(weekday,EligibilityCreatedAt) as EligibilityDOW,
+datepart(week,EligibilityCreatedAt) as EligibilityWeek,
+FIRST_VALUE(EligibilityCreatedAt) 
+OVER(PARTITION BY userID,datepart(weekday,EligibilityCreatedAt), 
+datepart(week,EligibilityCreatedAt) ORDER BY EligibilityCreatedAt DESC) AS Eligibility_last,
+dategenerated,
+JSON_VALUE (PaycheckArchetype,'$.PaycheckIdentificationMethod') AS [PaycheckModelUsed],
+MLModelScore,
+case when MLModelScore = 0 or MLModelScore is null then 'null'
+when MLModelScore < .01 then '1%' when MLModelScore < .02 then '2%' when MLModelScore < .03 then '3%' when MLModelScore < .04 then '4%' when MLModelScore < .05 then '5%'
+when MLModelScore < .06 then '6%' when MLModelScore < .07 then '7%' when MLModelScore < .08 then '8%' when MLModelScore < .09 then '9%' when MLModelScore < .10 then '10%'
+when MLModelScore < .11 then '11%' when MLModelScore < .12 then '12%' when MLModelScore < .13 then '13%' when MLModelScore < .14 then '14%' when MLModelScore < .15 then '15%'
+when MLModelScore < .16 then '16%' when MLModelScore < .17 then '17%' when MLModelScore < .18 then '18%' when MLModelScore < .19 then '19%' when MLModelScore < .20 then '20%'
+when MLModelScore < .21 then '21%' when MLModelScore < .22 then '22%' when MLModelScore < .23 then '23%' when MLModelScore < .24 then '24%' when MLModelScore < .25 then '25%'
+when MLModelScore < .26 then '26%' when MLModelScore < .27 then '27%' when MLModelScore < .28 then '28%' when MLModelScore < .29 then '29%' when MLModelScore < .30 then '30%'
+when MLModelScore >.30 then '31%' end as Helium_bucket,
+case when MLModelScore = 0 or MLModelScore is null then 'null'
+when MLModelScore < .01 then '1%' when MLModelScore < .02 then '2%' when MLModelScore < .03 then '3%' when MLModelScore < .04 then '4%' when MLModelScore < .05 then '5%'
+when MLModelScore < .06 then '6%' when MLModelScore < .07 then '7%' when MLModelScore < .08 then '8%' when MLModelScore < .14 then '14%' 
+when MLModelScore < .16 then '16%' when MLModelScore < .19 then '19%' when MLModelScore < .25 then '25%'
+when MLModelScore < .30 then '30%'
+when MLModelScore >.30 then '31%' end as Helium_bucket_granular
+into #Eligibility1
+From userCashAdvanceEligibility a
+left join UserCreditVariable c with (nolock)
+on a.userCreditVariableID = c.userCreditVariableID
+where DateGenerated >= '2022-07-01'
+and CreditPolicy = 2
+---- makes sample size smaller by taking one in every 10----
+and userID % 10 = 0
+---- Eligibility every 2 weeks ----
+and datepart(week,EligibilityCreatedAt) % 2 = 0
+​
+
+---- Second 
+drop table #Eligibility2
+select
+userID, AmountEligible, EligibilityCreatedAt,
+EligibilityDOW, EligibilityWeek, Eligibility_last,
+dategenerated, PaycheckModelUsed,
+MLModelScore, Helium_bucket, Helium_Bucket_granular
+into #Eligibility2
+from #Eligibility1 a
+where EligibilityCreatedAt = Eligibility_last
+​
+​
+​
+drop table #Eligibility3
+select a.*,
+    (select 1-count(*) from #Eligibility2 b 
+        where b.EligibilityCreatedAt >= a.EligibilityCreatedAt
+        and b.userID = a.userID
+		and b.EligibilityDOW =a.EligibilityDOW) as advanceCnt
+into #Eligibility3
+from #Eligibility2 a
+​
+​
+drop table #Eligibility4
+select a.*,
+    (select amountEligible from #Eligibility3 b 
+        where b.advanceCnt = a.advanceCnt - 1
+        and b.userID = a.userID
+		and b.EligibilityDOW =a.EligibilityDOW) as previousAmount,
+	(select PaycheckModelUsed from #Eligibility3 b 
+        where b.advanceCnt = a.advanceCnt - 1
+        and b.userID = a.userID
+		and b.EligibilityDOW =a.EligibilityDOW) as previousPaycheck,
+	(select MLModelScore from #Eligibility3 b 
+        where b.advanceCnt = a.advanceCnt - 1
+        and b.userID = a.userID
+		and b.EligibilityDOW =a.EligibilityDOW) as previousMLScore,
+	(select Helium_Bucket_granular from #Eligibility3 b 
+        where b.advanceCnt = a.advanceCnt - 1
+        and b.userID = a.userID
+		and b.EligibilityDOW =a.EligibilityDOW) as previousBucket,
+	(select eligibilityCreatedAt from #Eligibility3 b 
+        where b.advanceCnt = a.advanceCnt - 1
+        and b.userID = a.userID
+		and b.EligibilityDOW =a.EligibilityDOW) as previousCreatedAt
+into #Eligibility4
+from #Eligibility3 a
+​
+​
+drop table #Advances
+SELECT 
+b.userID, a.advanceDate, a.repayDate, a.CashAdvanceStatus,
+c.DateSubmitted as Ach_dt,
+FIRST_VALUE(DateSubmitted) OVER(PARTITION BY a.UserCashAdvanceId ORDER BY DateSubmitted DESC) AS Last_Ach_dt,
+c.Status as Ach_status,
+d.CreatedAt as Stripe_dt,
+FIRST_VALUE(CreatedAt) OVER(PARTITION BY a.UserCashAdvanceId ORDER BY CreatedAt DESC) AS Last_Stripe_dt,
+d.Status as Stripe_status
+into #Advances
+FROM UserCashAdvance a with (nolock)
+inner join UserCashAdvanceSubscription b
+on a.UserCashAdvanceSubscriptionId = b.UserCashAdvanceSubscriptionId
+	LEFT JOIN (
+		SELECT
+			UserCashAdvanceId,DateSubmitted, 
+			case when [Status] = 0 then 'pending'
+				 when [Status] = 1 then 'canceled'
+				 when [Status] = 2 then 'processing'
+				 when [Status] = 3 then 'hold'
+				 when [Status] = 4 then 'succeeded'
+				 when [Status] = 5 then 'failed'
+				 when [Status] = 6 then 'corrected' end as [Status]
+		FROM UserCashAdvanceAchTransactions a with (nolock)
+			INNER JOIN AchTransactions b ON a.AchTransactionID = b.AchTransactionID
+		WHERE
+			IsDistribution = 0) c ON a.UserCashAdvanceId = c.UserCashAdvanceId
+	LEFT JOIN (
+		SELECT
+			UserCashAdvanceId,CreatedAt, 
+			case when [Status] = 0 then 'pending'
+				 when [Status] = 1 then 'succeeded'
+				 when [Status] = 2 then 'failed' end as [Status]
+		FROM UserCashAdvanceStripeTransactions A with (nolock)
+			INNER JOIN StripeTransactions B ON A.StripeTransactionId = B.StripeTransactionId
+		WHERE
+			IsDistribution = 0) d ON a.UserCashAdvanceId = d.UserCashAdvanceId
+where repaydate > '2022-08-01';
+​
+​
+drop table #Advances2
+SELECT * 
+into #Advances2
+from #Advances
+where (Last_Ach_dt = Ach_dt or Last_Ach_dt is null) and (Last_Stripe_dt = Stripe_dt or Last_Stripe_dt is null)
+group by userID, advanceDate, repayDate, CashAdvanceStatus,Ach_dt, Last_Ach_dt, Ach_status, Stripe_dt, Last_Stripe_dt, Stripe_status;
+​
+​
+drop table #Advances3
+select 
+a.*,
+case when Ach_status = 'succeeded' and Ach_dt < dateadd(day,1,RepayDate) then 'On time'
+when Stripe_status = 'succeeded' and Stripe_dt < dateadd(day,1,RepayDate) then 'On time'
+when Ach_status = 'succeeded' and Ach_dt <= dateadd(day,7,RepayDate) then '1-7 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= dateadd(day,7,RepayDate) then '1-7 late'
+when Ach_status = 'succeeded' and Ach_dt <= dateadd(day,14,RepayDate) then '8-14 late'
+when Stripe_status = 'succeeded' and Stripe_dt <= dateadd(day,14,RepayDate) then '8-14 late'
+when Ach_status = 'succeeded' and Ach_dt > dateadd(day,14,RepayDate) then '>14 late'
+when Stripe_status = 'succeeded' and Stripe_dt > dateadd(day,14,RepayDate) then '>14 late'
+when Stripe_status = 'pending' or Ach_status = 'pending' then 'pending'
+when Stripe_status = 'failed' or Ach_status = 'failed' then 'failed'
+else Ach_status
+end as payment_status,
+case when Ach_status = 'succeeded' and Ach_dt < dateadd(day,1,RepayDate) then 0
+when Stripe_status = 'succeeded' and Stripe_dt < dateadd(day,1,RepayDate) then 0
+else 1
+end as isLate
+Into #Advances3
+from #Advances2 a;
+​
+​
+​
+drop table #Eligibility5
+select a.*,
+case when b.UserId is not null then 1 else 0 end as repay_flag,
+b.payment_status, b.isLate,
+case when c.UserId is not null then 1 else 0 end as advance_flag
+into #Eligibility5
+from #Eligibility4 a
+left join (select a.UserId, a.repaydate, a.payment_status, a.isLate
+		   from #advances3 a
+		   inner join #Eligibility4 b
+		   on a.UserId = b.UserId 
+		   and repayDate > previousCreatedAt
+		   and repayDate < eligibilityCreatedAt
+		   group by a.UserId, a.repaydate, a.payment_status,a.isLate) b
+		on a.UserId = b.UserId
+left join (select a.UserId, a.advanceDate, a.payment_status, a.isLate
+		   from #advances3 a
+		   inner join #Eligibility4 b
+		   on a.UserId = b.UserId 
+		   and advanceDate > previousCreatedAt
+		   and advanceDate < eligibilityCreatedAt
+		   group by a.UserId, a.advanceDate, a.payment_status,a.isLate) c
+		on a.UserId = c.UserId
+group by a.userID, a.AmountEligible, a.EligibilityCreatedAt, a.EligibilityDOW, /*a.EligibilityMonth,*/ a.EligibilityWeek, a.Eligibility_last, a.dateGenerated,
+a.PaycheckModelUsed, a.MLModelScore, a.Helium_bucket, a.Helium_Bucket_granular, a.AdvanceCnt, a.PreviousAmount,a.PreviousPaycheck,a.PreviousMLScore, a.previousBucket,a.PreviousCreatedAt,
+case when b.UserId is not null then 1 else 0 end,
+b.payment_status, b.isLate,
+case when c.UserId is not null then 1 else 0 end
+​
+​
+drop table #Eligibility6
+select a.userID, a.AmountEligible, a.EligibilityCreatedAt, a.EligibilityDOW, a.EligibilityWeek, /*a.EligibilityMonth,*/ a.Eligibility_last, a.dateGenerated,
+a.PaycheckModelUsed, a.MLModelScore, a.Helium_bucket, a.Helium_Bucket_granular, a.AdvanceCnt, a.PreviousAmount,a.PreviousPaycheck,a.PreviousMLScore, a.previousBucket,a.PreviousCreatedAt,
+repay_flag, max(isLate) as isLate
+into #Eligibility6
+from #Eligibility5 a
+group by a.userID, a.AmountEligible, a.EligibilityCreatedAt, a.EligibilityDOW, a.EligibilityWeek, /*a.EligibilityMonth,*/ a.Eligibility_last, a.dateGenerated,
+a.PaycheckModelUsed, a.MLModelScore, a.Helium_bucket, a.Helium_Bucket_granular, a.AdvanceCnt, a.PreviousAmount,a.PreviousPaycheck,a.PreviousMLScore, a.previousBucket,a.PreviousCreatedAt,
+repay_flag
+​
+​
+Select 
+    (amountEligible - PreviousAmount) as "Eligibility Drift", 
+    EligibilityDOW,
+    --EligibilityMonth,
+    Helium_Bucket_granular, 
+    previousBucket, 
+    paycheckModelUsed, 
+    previousPaycheck, 
+    count(*), 
+    repay_flag, 
+    isLate
+from #Eligibility6
+where previousAmount is not null
+group by amountEligible, PreviousAmount, Helium_Bucket_granular, previousBucket, paycheckModelUsed, previousPaycheck, repay_flag, isLate, /*a.EligibilityMonth,*/ EligibilityDOW
+--having count(*) > 50
+order by amountEligible, PreviousAmount, Helium_Bucket_granular, previousBucket, paycheckModelUsed, previousPaycheck, repay_flag, isLate, /*a.EligibilityMonth,*/ EligibilityDOW
+​
