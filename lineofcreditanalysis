@@ -1,0 +1,174 @@
+drop table if exists #LoansAppDriver 
+select 
+a.* 
+, b.[status] as ThriveStatus
+, b.creditAmount 
+, b.createdAt as Loan_CreatedAt
+, b.AutoPay
+, RANK() OVER(PARTITION BY a.userId ORDER BY a.CreatedAt DESC) AS loan_app_rank -- rank = 1 pulls most recent 
+into #LoansAppDriver
+from UserLoanApplications a 
+left join loans b 
+on a.UserLoanApplicationId = b.UserLoanApplicationId
+;
+
+drop table if exists #MostRecentLoan 
+select 
+* 
+into #MostRecentLoan
+from #LoansAppDriver 
+where loan_app_rank = 1 
+;
+
+
+drop table if exists #ThriveBureauDriver_1
+select 
+distinct g.userLoanApplicationId 
+, g.[status] as app_status
+, g.userID 
+, g.CreditAmount as ThriveLine 
+, g.ThriveStatus 
+, g.AutoPay as ThriveAutoPayStatus
+, g.Loan_CreatedAt
+, g.UserCreditModelId
+, RANK() OVER(PARTITION BY g.userId ORDER BY z.UserCreditSummaryId DESC) AS credit_report_rank -- 1 = most recent credit report pull 
+
+, z.UserCreditSummaryId 
+, convert(varchar, z.CreatedAt, 23) as CreatedAt
+, z.FicoScore 
+
+, DATEDIFF(month, c.Date, c.CreatedAt) as months_since_last_DQ 
+, c.AccountRating as DQAccountRating_enum
+, case when c.AccountRating = 2 then '30 days PD'
+when c.AccountRating = 3 then '60 days PD'
+when c.AccountRating = 4 then '90 days PD'
+when c.AccountRating = 5 then '120 days PD'
+when c.AccountRating = 6 then '150 days PD'
+when c.AccountRating = 8 then 'Reposession/Voluntary surrender'
+when c.AccountRating = 9 then 'Charge-off'
+when c.AccountRating = 10 then 'Bankruptcy'
+else 'n/a'
+end as DQAccountRating
+
+-- clean so that averages make sense
+, case when b.CurrentBalance is null then 0 else b.CurrentBalance end as IL_balance 
+, case when b.pastDue is null then 0 else b.pastDue  end as IL_pastDue_amount 
+, case when d.collectionCount is null then 0 else d.collectionCount end as collectionCount
+, case when d.TotalTradeCount is null then 0 else d.TotalTradeCount  end as TotalTradeCount 
+, case when d.NegativeTradeCount is null then 0 else d.NegativeTradeCount end as NegativeTradeCount 
+, case when d.HistoricalNegativeTradeCount is null then 0 else d.HistoricalNegativeTradeCount end as HistoricalNegativeTradeCount  
+, case when d.revolvingTradeCount is null then 0 else d.revolvingTradeCount end as revolvingTradeCount 
+, case when d.installmentTradeCount is null then 0 else d.installmentTradeCount end as installmentTradeCount
+, case when d.MortgageTradeCount is null then 0 else d.MortgageTradeCount end as MortgageTradeCount
+, case when d.OpenTradeCount is null then 0 else d.OpenTradeCount end as OpenTradeCount
+, case when d.TotalInquiryCount is null then 0 else d.TotalInquiryCount end as TotalInquiryCount 
+, case when d.openRevolvingTradeCount is null then 0 else d.openRevolvingTradeCount end as openRevolvingTradeCount 
+, case when d.openInstallmentTradeCount is null then 0 else d.openInstallmentTradeCount end as openInstallmentTradeCount
+, case when d.openMortgageTradeCount is null then 0 else d.openMortgageTradeCount end as openMortgageTradeCount
+, case when e.CreditLimit is null then 0 else e.CreditLimit end as Total_Revolving_Credit_Limit
+, case when e.CurrentBalance is null then 0 else e.CurrentBalance end as Total_Revolving_Current_Balance
+, case when e.PastDue is null then 0 else e.PastDue end as Total_Revolving_Past_Due 
+, case when f.CreditLimit is null then 0 else f.CreditLimit end as Total_Bureau_Credit_Limit
+, case when f.CurrentBalance is null then 0 else f.CurrentBalance end as Total_Bureau_Current_Balance
+, case when f.PastDue is null then 0 else f.PastDue end as Total_Bureau_Past_Due
+
+-- , b.CurrentBalance as IL_balance 
+-- , b.pastDue as IL_pastDue_amount 
+-- , d.collectionCount
+-- , d.TotalTradeCount 
+-- , d.NegativeTradeCount 
+-- , d.HistoricalNegativeTradeCount 
+-- , d.revolvingTradeCount 
+-- , d.installmentTradeCount 
+-- , d.MortgageTradeCount
+-- , d.OpenTradeCount 
+-- , d.TotalInquiryCount 
+-- , d.openRevolvingTradeCount 
+-- , d.openInstallmentTradeCount 
+-- , d.openMortgageTradeCount 
+-- , e.CreditLimit as Total_Revolving_Credit_Limit 
+-- , e.CurrentBalance as Total_Revolving_Current_Balance 
+-- , e.PastDue as Total_Revolving_Past_Due 
+-- , f.CreditLimit as Total_Bureau_Credit_Limit 
+-- , f.CurrentBalance as Total_Bureau_Current_Balance  
+-- , f.PastDue as Total_Bureau_Past_Due 
+
+into #ThriveBureauDriver_1
+
+from #MostRecentLoan g 
+left join UserCreditReports a
+on g.UserId = a.UserId 
+left join UserCreditSummary z 
+on a.UserCreditReportId = z.UserCreditReportId 
+left join UserCreditSummaryInstallmentAmount b 
+on z.UserCreditSummaryId  = b.UserCreditSummaryId 
+left join UserCreditSummaryMostRecentDelinquency c 
+on z.UserCreditSummaryId  = c.UserCreditSummaryId 
+left join UserCreditSummaryRecordCounts d 
+on z.UserCreditSummaryId  = d.UserCreditSummaryId 
+left join UserCreditSummaryRevolvingAmount e 
+on z.UserCreditSummaryId  = e.UserCreditSummaryId 
+left join UserCreditSummaryTotalAmount f 
+on z.UserCreditSummaryId  = f.UserCreditSummaryId 
+
+where 1=1 
+and z.UserCreditSummaryId is not null
+;
+
+
+drop table if exists #FICO_cats 
+select 
+*
+, case when FicoScore between 300 and 500 then '< 500'
+when FicoScore between 500 and 549 then '500-549'
+when FicoScore between 550 and 599 then '550-599' 
+when FicoScore >= 600 then '600+'
+else 'No Score' 
+end as fico_cat_50s 
+, floor(FicoScore/10)*10 as fico_cat_10s_base 
+, CONVERT(VARCHAR(7), Loan_CreatedAt, 126) as loan_month
+
+into #FICO_cats 
+from #ThriveBureauDriver_1 
+where 1=1 
+and credit_report_rank = 1 -- filtering to most recent credit report pulled
+;
+
+drop table if exists #TU_plus_modelScore
+SELECT
+a.*,
+m.DateGenerated,
+m.UserCreditVariableId,
+FIRST_VALUE(m.DateGenerated) OVER(PARTITION BY a.UserId, Loan_CreatedAt ORDER BY m.DateGenerated DESC) AS DateGenerated_last,
+b.Score
+into #TU_plus_modelScore
+from #FICO_cats a 
+
+left join UserCreditModel m
+on a.userCreditModelId = m.userCreditModelId 
+and m.DateGenerated < Loan_CreatedAt
+and m.DateGenerated > DATEADD(Day,-1,Loan_CreatedAt)
+
+left join (select UserCreditVariableId, Score			
+	from UserCreditVariableMLScore with (nolock)
+	where (modelType = 1)
+	) b 
+on m.UserCreditVariableId = b.UserCreditVariableId 
+
+;
+
+
+select 
+* 
+, round(Score, 2) as model_score_rounded 
+, case when floor(Score/0.01)*0.01 = 0 then '(0-0.01)'
+when floor(Score/0.01)*0.01 = 0.01 then '[0.01-0.02)'
+when floor(Score/0.01)*0.01 = 0.02 then '[0.02-0.03)'
+when floor(Score/0.01)*0.01 = 0.03 then '[0.03-0.04)'
+when floor(Score/0.01)*0.01 = 0.04 then '[0.04-0.05)'
+when floor(Score/0.01)*0.01 between 0.05 and 0.1 then '[0.05-0.10]'
+when floor(Score/0.01)*0.01 > 0.1 then '0.11+'
+end as model_score_category
+from #TU_plus_modelScore 
+where 1=1 
+and DateGenerated = DateGenerated_last
