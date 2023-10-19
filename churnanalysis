@@ -1,0 +1,76 @@
+/* This analysis was to identify types of subscription churn for strategic prioritization of reducing churn */
+
+drop table if exists #SubscriptionDetails;
+select UserId
+,UserSubscriptionId
+,row_number() over (partition by us.Userid order by us.UserSubscriptionId asc) as SubscriptionNumber
+into #SubscriptionDetails
+from usersubscription us ;
+
+drop table if exists #InvoiceDetails;
+select 
+us.userid
+,InvoiceAmount
+,InvoiceStatus
+,UserSubscriptionInvoiceId
+,Attempts
+,us.UserSubscriptionId
+,CollectionType
+,InvoiceDate
+,dateadd(day,30,invoicedate) as InvoiceAgingDate
+,CASE WHEN dateadd(day,30,invoicedate)<=GETDATE() then 'Aged' else 'NotAged' end as InvoiceAgingGrouping
+,CASE WHEN InvoiceStatus IN (0,3,4,6) then 'NotPaid' WHEN InvoiceStatus IN (1,2,5) then 'Paid' else 'NoInvoice' end as InvoiceStatusDescription
+,row_number() over (partition by us.UserId order by usi.UserSubscriptionInvoiceId asc) as InvoiceNumberUser
+,row_number() over (partition by us.UserSubscriptionId order by usi.UserSubscriptionInvoiceId asc) as InvoiceNumberSubscription
+,#subscriptionDetails.SubscriptionNumber
+into #InvoiceDetails
+from UserSubscriptionInvoice usi 
+inner join userSubscription us on usi.usersubscriptionid=us.usersubscriptionid
+inner join #subscriptionDetails on usi.usersubscriptionid=#subscriptionDetails.usersubscriptionid
+where 1=1
+and datediff(month,InvoiceDate,GETDATE())<=6
+;
+
+
+-- aggregate invoice details to prior & newest invoices for comparison
+
+select top 100 
+newestInvoice.*
+,precedingInvoice.*
+,CASE WHEN newestInvoice.InvoiceStatusDescription = 'Paid' AND precedingInvoice.InvoiceStatusDescription = 'Paid' and precedingInvoice.SubscriptionNumber=newestInvoice.SubscriptionNumber then 'Retained'
+WHEN newestInvoice.InvoiceStatusDescription = 'NotPaid' AND precedingInvoice.InvoiceStatusDescription = 'Paid' and  precedingInvoice.SubscriptionNumber=newestInvoice.SubscriptionNumber then 'RetainFail'
+WHEN newestInvoice.InvoiceStatusDescription = 'Paid' AND precedingInvoice.SubscriptionNumber=(newestInvoice.SubscriptionNumber-1) then 'Resubscribed'
+WHEN (newestInvoice.InvoiceStatusDescription = 'NotPaid' OR newestInvoice.InvoiceStatusDescription IS NULL) AND (precedingInvoice.SubscriptionNumber=(newestInvoice.SubscriptionNumber-1) or newestInvoice.SubscriptionNumber is null) then 'ResubscribeFail'
+WHEN newestInvoice.InvoiceStatusDescription = 'Paid' AND precedingInvoice.InvoiceStatusDescription = 'NotPaid' and  precedingInvoice.SubscriptionNumber=newestInvoice.SubscriptionNumber then 'Reactivated'
+WHEN newestInvoice.InvoiceStatusDescription = 'NotPaid' AND precedingInvoice.InvoiceStatusDescription = 'NotPaid' and  precedingInvoice.SubscriptionNumber=newestInvoice.SubscriptionNumber then 'ReactivateFail'
+else Null 
+end as ChurnGrouping
+
+from #InvoiceDetails as precedingInvoice
+left join #InvoiceDetails as newestInvoice on 
+    (newestInvoice.UserId=precedingInvoice.UserId 
+    and (newestInvoice.InvoiceNumberUser-1)=precedingInvoice.InvoiceNumberUser) -- join by invoice number at user level; comparison on & across subscription in the calculation above
+
+;
+0 comments on commit 6e5fc72
+@empowerJohnKim
+ 
+Leave a comment
+No file chosen
+Attach files by dragging & dropping, selecting or pasting them.
+ You’re not receiving notifications from this thread.
+Footer
+© 2023 GitHub, Inc.
+Footer navigation
+Terms
+Privacy
+Security
+Status
+Docs
+Contact GitHub
+Pricing
+API
+Training
+Blog
+About
+Create Churn decomposition · empowerCami/Product-Analysis@6e5fc72
