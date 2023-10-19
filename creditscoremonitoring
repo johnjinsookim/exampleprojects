@@ -1,0 +1,218 @@
+/* Example script for credit score monitoring */
+
+--- Credit scores
+select * from userCreditScoreOffers ; -- anyone that has been whitelisted will appear on this list
+select * from userCreditScoreProfiles; -- a per user table that has userCreditScoreProfileID + UserId
+select * from userCreditScoreEnrollments ; -- has the enrollment specific info (enrollment key with TU, whether cancelled)
+select * from userCreditScoreProfileActions ; -- action taken, status of enrollment, any errors that may have occurred 
+select * from userCreditScoreReports ; -- credit score presented to user + inquiry date
+select * from userCreditScoreReportToFactors; -- maps to CreditScoreFactors
+select * from  CreditScoreFactors; -- factors we get with score, what is presented to the user, whether it should be displayed, what priority it should be displayed
+
+-- will pull most recent month the user accessed the app
+select 
+* 
+from #driver
+where access_num_desc = 1 
+;
+
+select count(distinct userId) from userCreditScoreOffers where createdAtUtc >= '2023-05-06' --4371
+select count(distinct userId) from userCreditScoreProfiles where createdAtUtc >= '2023-05-06'; --357
+-- view welcome screen = 885 
+
+-- enrollment actions
+drop table if exists #CS_enrollment_action
+select 
+distinct a.userCreditScoreProfileId
+, b.userId
+, a.createdAtUtc 
+, row_number() over(partition by a.userCreditScoreProfileId order by a.CreatedAtUtc desc) as action_rank
+, a.errorCode 
+, a.errorMessage 
+, [action] as action_enum
+, case when [action] = 0 then 'Authenticate'
+when [action] = 1 then 'Enroll'
+when [action] = 2 then 'CancelEnrollment'
+when [action] = 3 then 'UpdateEnrollment'
+end as action_str
+, [status] as status_enum 
+, case when [status] = 0 then 'Initiated'
+when [status] = 1 then 'Succeeded'
+when [status] = 2 then 'Failed'
+end as status_str
+into #CS_enrollment_action
+from userCreditScoreProfileActions a 
+left join userCreditScoreProfiles b 
+on a.userCreditScoreProfileId = b.userCreditScoreProfileId
+;
+
+--- count of failed vs succeeded
+select 
+status_str 
+, count(distinct userCreditScoreProfileId) as tot_users
+from #CS_enrollment_action 
+where action_rank = 1 
+and createdAtUtc >= '2023-05-05'
+group by status_str 
+;
+
+-- error breakdown 
+select 
+distinct errorCode 
+, errorMessage
+, status_str
+, count(distinct userCreditScoreProfileId) as tot_users 
+from #CS_enrollment_action 
+where action_rank = 1 
+and createdAtUtc >= '2023-05-05'
+group by errorCode
+, errorMessage
+, status_str
+;
+
+--scores, row 1 = most recent 
+drop table if exists #score_categories
+select 
+distinct a.userCreditScoreProfileId 
+, b.userId 
+, a.InquiryDate 
+, convert(varchar(7), c.createdAtUtc , 23) as enroll_month
+, row_number() over(partition by a.userCreditScoreProfileId order by a.InquiryDate desc) as score_row 
+, case when a.Score = 4 then null else a.Score end as score_cleaned
+, case when a.Score = 4 then 'thin file / no hit' else 'scored' end as thinfile_ind
+, case when a.Score < 500 then ' < 500'
+when a.Score between 500 and 549 then '500-549'
+when a.Score between 550 and 599 then '550-599'
+when a.Score between 600 and 649 then '600-649'
+when a.Score between 650 and 699 then '650-699'
+when a.Score between 700 and 749 then '700-749'
+when a.Score between 750 and 799 then '750-799'
+when a.Score >= 800 then '800+'
+end as score_50_cat
+into #score_categories
+from userCreditScoreReports a
+left join userCreditScoreProfiles b 
+on a.userCreditScoreProfileId = b.userCreditScoreProfileId 
+left join userCreditScoreEnrollments c 
+on a.userCreditScoreProfileId = c.userCreditScoreProfileId 
+;
+
+-- most recent ML score / CA elig for scored users 
+drop table if exists #CAelig_starter
+select 
+distinct
+a.userId 
+, a.userCreditVariableId  
+, row_number() over(partition by a.UserId order by a.DateGenerated desc) as cv_rank
+into #CAelig_starter
+from userCreditVariable a 
+left join #score_categories b
+on a.userId = b.userId
+where 1=1 
+and a.userId in (select distinct userId from #score_categories)
+and datediff(day, a.DateGenerated, b.InquiryDate)  < 7
+;
+
+
+drop table if exists #CAelig_starter2
+select 
+distinct a.userId 
+, max(b.amountEligible) as highest_amountEligible_atCS_update -- taking max eligible (vs most recent)
+-- , b.amountEligible
+-- , case when b.amountEligible > 0 then 1 else 0 end as eligible_ind 
+into #CAelig_starter2
+from #CAelig_starter a
+left join userCashAdvanceEligibility b
+on a.userCreditVariableId = b.userCreditVariableId 
+group by a.userId 
+;
+
+select 
+a.score_cleaned
+, a.thinfile_ind 
+, a.score_50_cat
+, a.enroll_month
+, b.highest_amountEligible_atCS_update -- winthin 7 days of inquiry 
+, count(distinct userCreditScoreProfileId) as tot_users 
+from #score_categories a 
+left join #CAelig_starter2 b 
+on a.userId = b.userId 
+group by a.score_cleaned
+, a.thinfile_ind 
+, a.score_50_cat
+, a.enroll_month
+, b.highest_amountEligible_atCS_update -- winthin 7 days of inquiry 
+;
+
+
+
+--score factors
+drop table if exists #CS_factors
+select 
+distinct a.userCreditScoreReportId 
+, a.userCreditScoreProfileId 
+, a.InquiryDate 
+, row_number() over(partition by a.userCreditScoreProfileId order by a.InquiryDate desc) as score_row 
+, a.Score 
+, b.creditScoreFactorId
+, c.Empowerstatement 
+, c.shouldDisplay 
+, c.code
+, case when c.code like '%P%' then 'positive' else 'negative' end as factor_type
+into #CS_factors
+from userCreditScoreReports a
+left join userCreditScoreReportToFactors b 
+on a.userCreditScoreReportId  = b.userCreditScoreReportId 
+left join CreditScoreFactors c 
+on b.creditScoreFactorId = c.creditScoreFactorId
+order by userCreditScoreReportId 
+;
+
+drop table if exists #score_and_CAelig
+select 
+distinct a.userCreditScoreProfileId
+, a.userId
+, a.score_cleaned
+, a.thinfile_ind 
+, a.score_50_cat
+, a.enroll_month
+, b.highest_amountEligible_atCS_update -- winthin 7 days of inquiry 
+into #score_and_CAelig 
+from #score_categories a 
+left join #CAelig_starter2 b 
+on a.userId = b.userId 
+;
+
+select 
+a.score_cleaned
+, a.thinfile_ind 
+, a.score_50_cat
+, a.enroll_month
+, a.highest_amountEligible_atCS_update 
+, b.[Empowerstatement] 
+, b.shouldDisplay
+, b.factor_type
+, count(distinct b.userCreditScoreProfileId) as tot_users 
+from #score_and_CAelig a 
+left join #CS_factors b 
+on a.userCreditScoreProfileId = b.userCreditScoreProfileId
+group by a.score_cleaned
+, a.thinfile_ind 
+, a.score_50_cat
+, a.enroll_month
+, a.highest_amountEligible_atCS_update 
+, b.[Empowerstatement] 
+, b.shouldDisplay
+, b.factor_type
+;
+
+select 
+distinct [Empowerstatement] 
+, shouldDisplay
+, factor_type
+, count(distinct userCreditScoreReportId) as tot_users 
+from #CS_factors 
+group by [Empowerstatement] 
+, factor_type
+, shouldDisplay
+;
