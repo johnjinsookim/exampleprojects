@@ -1,0 +1,59 @@
+drop table if exists #cashAdvanceEligibilityByRecordNumber;
+select 
+    ucv.userid,min(ucae.usercashadvanceeligibilityid) as firstRecord
+into #cashAdvanceEligibilityByRecordNumber
+from usercashadvanceeligibility ucae 
+inner join usercreditvariable ucv on ucae.usercreditvariableid=ucv.usercreditvariableid -- connect to collect userid
+inner join [dbo].[user] u on ucv.userid=u.userid
+where 1=1
+and datediff(day,u.datecreated,getdate())<7
+group by 
+ucv.userid;
+
+drop table if exists #firstCashAdvanceEligibilityRecord;
+select 
+    userid,ucae.usercreditvariableid,eligibilitycreatedat as firstRecordGeneratedTimestamp
+into #firstCashAdvanceEligibilityRecord
+from #cashAdvanceEligibilityByRecordNumber
+inner join usercashadvanceeligibility ucae on #cashAdvanceEligibilityByRecordNumber.firstRecord=ucae.usercashadvanceeligibilityid
+where 1=1;
+
+drop table if exists #maxEligibilityInFirst10Minutes;
+
+select 
+    ucv.userid,max(ucae.amounteligible) as maxOfferInFirst10Minutes
+into #maxEligibilityInFirst10Minutes
+from usercashadvanceeligibility ucae 
+inner join usercreditvariable ucv on ucae.usercreditvariableid=ucv.usercreditvariableid -- connect to collect userid
+inner join #firstCashAdvanceEligibilityRecord on ucv.userid=#firstCashAdvanceEligibilityRecord.userid
+where 1=1 
+and datediff(minute,firstRecordGeneratedTimestamp,ucae.eligibilitycreatedat)<=10
+group by 
+ucv.userid;
+
+drop table if exists #maxEligibilityOnDay1;
+
+select 
+    ucv.userid,max(ucae.amounteligible) as maxOffer
+into #maxEligibilityOnDay1
+from usercashadvanceeligibility ucae 
+inner join usercreditvariable ucv on ucae.usercreditvariableid=ucv.usercreditvariableid -- connect to collect userid
+inner join #firstCashAdvanceEligibilityRecord on ucv.userid=#firstCashAdvanceEligibilityRecord.userid
+where 1=1 
+and datediff(day,firstRecordGeneratedTimestamp,ucae.eligibilitycreatedat)<=1
+group by 
+ucv.userid;
+
+select u.userid
+, #maxEligibilityOnDay1.*
+,#maxEligibilityInFirst10Minutes.*
+,CASE WHEN us.usersubscriptionid is null then 'NoSubscription' else 'Subscription' end as SubscriptionGrouping
+,us.usersubscriptionid
+
+from [dbo].[User] U 
+inner join #firstCashAdvanceEligibilityRecord on u.userid=#firstCashAdvanceEligibilityRecord.userid
+left join usersubscription us on u.userid=us.userid
+left join #maxEligibilityOnDay1 on u.userid=#maxEligibilityOnDay1.userid
+left join #maxEligibilityInFirst10Minutes on u.userid=#maxEligibilityInFirst10Minutes.userid
+where 1=1 
+and DATEDIFF(day,#firstCashAdvanceEligibilityRecord.firstRecordGeneratedTimestamp,GETDATE())<=7;
